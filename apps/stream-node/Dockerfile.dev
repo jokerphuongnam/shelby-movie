@@ -1,0 +1,19 @@
+FROM node:20-alpine
+WORKDIR /app
+RUN npm install -g pnpm
+
+# Install workspace deps (leverages layer cache when package.json unchanged)
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/shared-types/package.json ./packages/shared-types/
+COPY apps/stream-node/package.json ./apps/stream-node/
+RUN pnpm install
+
+# Build shared-types so its dist/ is available to the service at runtime
+COPY packages/shared-types/ ./packages/shared-types/
+RUN pnpm --filter @shelby-movie/shared-types build
+
+# Copy service source (overridden at runtime by docker-compose volume mount)
+COPY apps/stream-node/src ./apps/stream-node/src
+
+WORKDIR /app/apps/stream-node
+CMD ["pnpm", "dev"]

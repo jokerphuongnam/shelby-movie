@@ -1,0 +1,19 @@
+FROM node:20-alpine
+WORKDIR /app
+RUN npm install -g pnpm
+
+# Install workspace deps (leverages layer cache when package.json unchanged)
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages/shared-types/package.json ./packages/shared-types/
+COPY apps/api-gateway/package.json ./apps/api-gateway/
+RUN pnpm install
+
+# Build shared-types so its dist/ is available to the service at runtime
+COPY packages/shared-types/ ./packages/shared-types/
+RUN pnpm --filter @shelby-movie/shared-types build
+
+# Copy service source (overridden at runtime by docker-compose volume mount)
+COPY apps/api-gateway/src ./apps/api-gateway/src
+
+WORKDIR /app/apps/api-gateway
+CMD ["pnpm", "dev"]

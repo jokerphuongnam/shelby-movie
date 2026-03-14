@@ -1,0 +1,170 @@
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: apps/api-gateway/Dockerfile
+    container_name: api-gateway
+    env_file: ./apps/api-gateway/.env
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/shelbymovie
+      - NATS_URL=nats://nats-server:4222
+      - PORT=3000
+    ports:
+      - "8080:3000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      nats-server:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - shelby-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  stream-node:
+    build:
+      context: .
+      dockerfile: apps/stream-node/Dockerfile
+    container_name: stream-node
+    env_file: ./apps/stream-node/.env
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - NATS_URL=nats://nats-server:4222
+      - PORT=4000
+    depends_on:
+      redis:
+        condition: service_healthy
+      nats-server:
+        condition: service_started
+    networks:
+      - shelby-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mongodb:
+    image: mongo:7
+    container_name: mongodb
+    command:
+      - mongod
+      - --quiet
+      - --setParameter
+      - "logComponentVerbosity={network:{verbosity:-1},command:{verbosity:-1}}"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 40s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - shelby-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+    networks:
+      - shelby-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  nats-server:
+    image: nats:2.10-alpine
+    container_name: nats-server
+    command: ["-js"]
+    networks:
+      - shelby-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      args:
+        # Pass CACHE_BUST=$(date +%s) to force a fresh Next.js build
+        CACHE_BUST: ${CACHE_BUST:-1}
+        NEXT_PUBLIC_API_URL: http://localhost
+        NEXT_PUBLIC_STREAM_URL: http://localhost
+        NEXT_PUBLIC_APTOS_NETWORK: testnet
+        NEXT_PUBLIC_APTOS_NODE_URL: https://api.shelbynet.shelby.xyz/shelby
+        NEXT_PUBLIC_SHELBY_CONTRACT: ${NEXT_PUBLIC_SHELBY_CONTRACT:-0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a}
+        NEXT_PUBLIC_SHELBY_API_KEY: ${NEXT_PUBLIC_SHELBY_API_KEY:-}
+        NEXT_PUBLIC_TREASURY_ADDRESS: ${NEXT_PUBLIC_TREASURY_ADDRESS:-0x0}
+    container_name: frontend
+    ports:
+      - "4545:3000"
+    networks:
+      - shelby-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+      stream-node:
+        condition: service_started
+      frontend:
+        condition: service_started
+    networks:
+      - shelby-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  shelby-net:
+    driver: bridge
+
+volumes:
+  mongo-data:
+  redis-data:

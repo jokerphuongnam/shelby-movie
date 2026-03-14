@@ -1,0 +1,15 @@
+{
+  "name": "shelby-movie",
+  "private": true,
+  "scripts": {
+    "dev:gateway": "pnpm --filter api-gateway dev",
+    "dev:stream": "pnpm --filter stream-node dev",
+    "dev:frontend": "pnpm --filter frontend dev",
+    "build": "pnpm --filter shared-types build && pnpm --filter api-gateway build && pnpm --filter stream-node build && pnpm --filter frontend build",
+    "docker:up": "docker-compose up --build",
+    "docker:down": "docker-compose down"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  }
+}

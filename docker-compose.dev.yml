@@ -1,0 +1,25 @@
+# Development overlay — run with:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Hot-reload: changes to src/ in api-gateway or stream-node are picked up
+# automatically by ts-node-dev inside the container.
+# If you change packages/shared-types, rebuild the images (--build).
+
+services:
+  api-gateway:
+    build:
+      context: .
+      dockerfile: apps/api-gateway/Dockerfile.dev
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - ./apps/api-gateway/src:/app/apps/api-gateway/src
+
+  stream-node:
+    build:
+      context: .
+      dockerfile: apps/stream-node/Dockerfile.dev
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - ./apps/stream-node/src:/app/apps/stream-node/src
