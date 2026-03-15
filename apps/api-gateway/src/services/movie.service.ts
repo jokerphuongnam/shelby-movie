@@ -95,6 +95,11 @@ export async function listMovies(): Promise<MovieDto[]> {
   return movies.map(toDto);
 }
 
+export async function listMoviesByCreator(creatorAddress: string): Promise<MovieDto[]> {
+  const movies = await Movie.find({ creatorAddress: creatorAddress.toLowerCase() }).sort({ createdAt: -1 });
+  return movies.map(toDto);
+}
+
 export async function getMovie(id: string): Promise<MovieDto | null> {
   const movie = await Movie.findById(id);
   return movie ? toDto(movie) : null;

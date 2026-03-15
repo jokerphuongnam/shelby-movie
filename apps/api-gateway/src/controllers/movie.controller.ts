@@ -9,6 +9,11 @@ export async function home(req: Request, res: Response) {
 }
 
 export async function index(req: Request, res: Response) {
+  const { creatorAddress } = req.query;
+  if (creatorAddress) {
+    const movies = await movieService.listMoviesByCreator(creatorAddress as string);
+    return res.json(movies);
+  }
   const movies = await movieService.listMovies();
   res.json(movies);
 }
