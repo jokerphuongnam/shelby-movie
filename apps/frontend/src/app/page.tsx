@@ -3,17 +3,18 @@ import { HeroBanner } from "@/components/movie/HeroBanner";
 import { MovieRow } from "@/components/movie/MovieRow";
 import { ContinueWatchingRow } from "@/components/movie/ContinueWatchingRow";
 import { WelcomeHero } from "@/components/home/WelcomeHero";
+import { getAlphaHomeData } from "@/lib/alpha-data";
 import type { HomeDto } from "@shelby-movie/shared-types";
 
 export const dynamic = "force-dynamic";
 
+const IS_ALPHA = process.env.NEXT_PUBLIC_ALPHA_TEST === "true";
 const EMPTY_HOME: HomeDto = { featured: null, continueWatching: [], sections: [] };
+const SERVER_API = process.env.INTERNAL_API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "";
 
 async function fetchHome(): Promise<HomeDto> {
   try {
-    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/movies/home`, {
-      cache: "no-store",
-    });
+    const res = await fetch(`${SERVER_API}/api/movies/home`, { cache: "no-store" });
     if (!res.ok) return EMPTY_HOME;
     return res.json();
   } catch {
@@ -22,7 +23,7 @@ async function fetchHome(): Promise<HomeDto> {
 }
 
 export default async function HomePage() {
-  const { featured, sections } = await fetchHome();
+  const { featured, sections } = IS_ALPHA ? getAlphaHomeData() : await fetchHome();
   const hasContent = featured || sections.some((s) => s.movies.length > 0);
 
   return (
@@ -37,7 +38,7 @@ export default async function HomePage() {
 
       {hasContent ? (
         <div className="space-y-10 py-10">
-          <ContinueWatchingRow />
+          {!IS_ALPHA && <ContinueWatchingRow />}
           {sections.map((section) => (
             <MovieRow key={section.title} title={section.title} movies={section.movies} />
           ))}

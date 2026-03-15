@@ -77,6 +77,18 @@ export async function grantFreeAccess(dto: FreeAccessDto): Promise<VerifyPayment
 
   const { sessionToken, expiresAt } = createSessionToken();
 
+  // Create/update an Access record so the movie appears in the user's Library
+  if (walletAddress && walletAddress !== "anonymous") {
+    await Access.updateOne(
+      { userAddress: walletAddress.toLowerCase(), movieId },
+      {
+        $setOnInsert: { txHash: `free-${crypto.randomBytes(8).toString("hex")}` },
+        $set: { lastWatched: new Date() },
+      },
+      { upsert: true }
+    );
+  }
+
   await publishVideoAuthorized({
     sessionToken,
     walletAddress: walletAddress || "anonymous",

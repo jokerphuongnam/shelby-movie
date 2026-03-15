@@ -7,6 +7,29 @@ import {
   chunkByteRange,
 } from "./cache.service";
 
+function isPublicUrl(blobId: string) {
+  return blobId.startsWith("https://") || blobId.startsWith("http://");
+}
+
+async function fetchPublicRange(url: string, start: number, end: number): Promise<Buffer> {
+  const res = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } });
+  if (!res.ok && res.status !== 206) throw new Error(`HTTP ${res.status} fetching public URL`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+async function resolvePublicSize(url: string): Promise<number> {
+  const head = await fetch(url, { method: "HEAD" });
+  const len = parseInt(head.headers.get("content-length") ?? "0", 10);
+  if (len > 0) return len;
+  const rangeRes = await fetch(url, { headers: { Range: "bytes=0-0" } });
+  const cr = rangeRes.headers.get("content-range");
+  if (cr) {
+    const total = parseInt(cr.split("/")[1], 10);
+    if (!isNaN(total) && total > 0) return total;
+  }
+  throw new Error("Cannot determine size of public URL");
+}
+
 export interface StreamResult {
   stream: Readable;
   contentLength: number;
@@ -32,6 +55,17 @@ export async function streamRange(
   rangeEnd: number,
   totalSize: number
 ): Promise<StreamResult> {
+  // Alpha mode: blobId is a public HTTP URL — bypass Shelby entirely
+  if (isPublicUrl(blobId)) {
+    const data = await fetchPublicRange(blobId, rangeStart, rangeEnd);
+    return {
+      stream: Readable.from(data),
+      contentLength: data.length,
+      contentRange: `bytes ${rangeStart}-${rangeEnd}/${totalSize}`,
+      totalSize,
+    };
+  }
+
   const startChunk = chunkIndexForByte(rangeStart);
   const endChunk = chunkIndexForByte(rangeEnd);
 
@@ -79,6 +113,10 @@ export async function streamRange(
  * falling back to a full metadata query if the SDK supports it.
  */
 export async function resolveBlobSize(blobId: string): Promise<number> {
+  // Alpha mode: resolve size via HTTP HEAD/Range on the public URL
+  if (isPublicUrl(blobId)) {
+    return resolvePublicSize(blobId);
+  }
   // TODO: Use shelbyClient.stat(blobId) once SDK supports metadata queries
   // For now, download full blob to determine size (only on first access)
   const full = await shelbyClient.download(blobId);

@@ -1,9 +1,12 @@
 "use client";
 
 import { useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { MovieUploadForm } from "./MovieUploadForm";
 
 export function UploadModal({ onClose }: { onClose: () => void }) {
+  const router = useRouter();
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -11,6 +14,12 @@ export function UploadModal({ onClose }: { onClose: () => void }) {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  function handleSuccess(redirectTo: string) {
+    sessionStorage.setItem("alpha_upload_toast", "1");
+    onClose();
+    router.push(redirectTo);
+  }
 
   return (
     <div
@@ -30,7 +39,7 @@ export function UploadModal({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         <div className="px-8 py-6">
-          <MovieUploadForm />
+          <MovieUploadForm onSuccess={handleSuccess} />
         </div>
       </div>
     </div>

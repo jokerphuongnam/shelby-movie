@@ -6,9 +6,11 @@ import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
 
 const PROGRESS_SYNC_INTERVAL_MS = 30_000;
 const CONFETTI_COLORS = ["#e50914", "#f5c518", "#00d9ff", "#ff6b6b", "#7fff00", "#ffd700"];
+const IS_ALPHA = process.env.NEXT_PUBLIC_ALPHA_TEST === "true";
 
 interface VideoPlayerProps {
   sessionToken: string;
+  directUrl?: string;
   initialPosition?: number;
   movieId?: string;
   episodeNumber?: number;
@@ -62,6 +64,7 @@ function Confetti() {
 
 export function VideoPlayer({
   sessionToken,
+  directUrl,
   initialPosition = 0,
   movieId,
   episodeNumber = 1,
@@ -73,12 +76,13 @@ export function VideoPlayer({
   const videoRef = useRef<HTMLVideoElement>(null);
   const lastSyncedPosition = useRef(0);
   const previewFired = useRef(false);
-  const { account, signAndSubmitTransaction, connected } = useWallet();
+  const { account, signAndSubmitTransaction, signMessage, connected } = useWallet();
   const [showConfetti, setShowConfetti] = useState(false);
-  // "signing" = waiting for Petra confirmation, "confirming" = waiting for Aptos finality
   const [donationStep, setDonationStep] = useState<"signing" | "confirming" | null>(null);
+  const [alphaDonationToast, setAlphaDonationToast] = useState(false);
 
-  const streamUrl = `${process.env.NEXT_PUBLIC_STREAM_URL}/stream/play?token=${sessionToken}`;
+  // Alpha mode: directUrl is a public HTTP URL — play it directly without proxying through stream-node
+  const streamUrl = directUrl ?? `${process.env.NEXT_PUBLIC_STREAM_URL}/stream/play?token=${sessionToken}`;
 
   // Seek to resume position once buffered
   useEffect(() => {
@@ -166,11 +170,32 @@ export function VideoPlayer({
     };
   }, [syncProgress]);
 
-  // Task 2: donation with loading steps and confetti on success
   async function handleDonation() {
     if (!connected || !account || !creatorAddress || !priceAPT) return;
     try {
       setDonationStep("signing");
+
+      if (IS_ALPHA) {
+        if (signMessage) {
+          try {
+            await signMessage({
+              message: `Supporting Creator for: ${movieId ?? "this movie"} — Amount: ${priceAPT.toFixed(2)} APT`,
+              nonce: Date.now().toString(),
+            });
+          } catch {
+            // cancelled — proceed anyway in demo mode
+          }
+        }
+        setDonationStep("confirming");
+        await new Promise((r) => setTimeout(r, 1000));
+        setDonationStep(null);
+        setAlphaDonationToast(true);
+        setTimeout(() => setAlphaDonationToast(false), 4000);
+        setShowConfetti(true);
+        setTimeout(() => setShowConfetti(false), 4000);
+        return;
+      }
+
       const donationOctas = Math.round(priceAPT * 1e8);
       const response = await signAndSubmitTransaction({
         data: {
@@ -192,6 +217,11 @@ export function VideoPlayer({
   return (
     <div className="space-y-3 w-full">
       {showConfetti && <Confetti />}
+      {alphaDonationToast && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[200] flex items-center gap-2.5 px-5 py-3 rounded-xl bg-green-600 text-white text-sm font-semibold shadow-2xl animate-toast-in whitespace-nowrap">
+          ♥ Thank you for supporting the creator!
+        </div>
+      )}
       <div className="relative rounded-xl overflow-hidden bg-black aspect-video w-full">
         <video
           ref={videoRef}
@@ -204,13 +234,14 @@ export function VideoPlayer({
           Your browser does not support the video tag.
         </video>
 
-        {/* Task 2: donation transaction loading overlay */}
         {donationStep && (
           <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center gap-3">
             <Spinner />
             <p className="text-white text-sm">
               {donationStep === "signing"
                 ? "Confirm in your Petra wallet…"
+                : IS_ALPHA
+                ? "Verifying payment on Alpha Node…"
                 : "Waiting for Aptos network confirmation…"}
             </p>
           </div>

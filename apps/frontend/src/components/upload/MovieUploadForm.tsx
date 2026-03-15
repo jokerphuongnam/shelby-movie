@@ -1,21 +1,24 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useForm, useFieldArray } from "react-hook-form";
 import { useWallet, WalletName } from "@aptos-labs/wallet-adapter-react";
 import { Aptos, AptosConfig, Network, Hex } from "@aptos-labs/ts-sdk";
+import type { MovieDto } from "@shelby-movie/shared-types";
+import { getRandomAlphaThumbnail } from "@/lib/alpha-data";
 import { Upload, CheckCircle, Film, X, ImageIcon, Trash2, Clock } from "lucide-react";
 
 const CHUNK_SIZE = 5 * 1024 * 1024;
-const MAX_THUMBNAIL_MB = 5;
-const MAX_VIDEO_MB = 500;
-// Sourced from env so operators can tune pricing without a code deploy.
-// MaxPrice = floor(duration_minutes) × PRICE_PER_MINUTE_APT
+const MAX_THUMBNAIL_MB = 0;
+const MAX_VIDEO_MB = 0;
 const PRICE_PER_MINUTE_APT = parseFloat(process.env.NEXT_PUBLIC_APT_PRICE_MULTIPLIER ?? "0.5");
-const APT_TO_OCTAS = 1e8; // 1 APT = 10^8 Octas
+const APT_TO_OCTAS = 1e8;
+const IS_ALPHA = process.env.NEXT_PUBLIC_ALPHA_TEST === "true";
 
-const UPLOAD_STAGES = ["Commitments", "Register on Aptos", "Put to Shelby RPC"] as const;
-type UploadStage = (typeof UPLOAD_STAGES)[number] | null;
+const UPLOAD_STAGES_ONCHAIN = ["Commitments", "Register on Aptos", "Put to Shelby RPC"] as const;
+const UPLOAD_STAGES_ALPHA = ["Encoding metadata…", "Registering on Shelby Alpha Node…", "Confirmed on Aptos Testnet…"] as const;
+const UPLOAD_STAGES = IS_ALPHA ? UPLOAD_STAGES_ALPHA : UPLOAD_STAGES_ONCHAIN;
+type UploadStage = string | null;
 
 const CATEGORIES = [
   "Action", "Romance", "Animation", "Comedy", "Drama",
@@ -146,7 +149,7 @@ function ThumbnailDropzone({ onFile, error }: ThumbnailDropzoneProps) {
 
   const handle = useCallback((f: File) => {
     if (!f.type.startsWith("image/")) { setSizeError("Only image files allowed"); return; }
-    if (f.size > MAX_THUMBNAIL_MB * 1024 * 1024) {
+    if (MAX_THUMBNAIL_MB > 0 && f.size > MAX_THUMBNAIL_MB * 1024 * 1024) {
       setSizeError(`Max thumbnail size is ${MAX_THUMBNAIL_MB} MB`);
       return;
     }
@@ -182,7 +185,7 @@ function ThumbnailDropzone({ onFile, error }: ThumbnailDropzoneProps) {
         <p className="text-sm text-gray-400">
           Poster / Thumbnail <span className="text-red-500">*</span>
         </p>
-        <p className="text-xs text-gray-600">1280×720 recommended · max {MAX_THUMBNAIL_MB} MB</p>
+        <p className="text-xs text-gray-600">1280×720 recommended</p>
       </div>
       {preview ? (
         <div className="relative w-36 group">
@@ -294,7 +297,7 @@ function VideoDropzone({ onFile, label, hint, error }: VideoDropzoneProps) {
 
   const handle = useCallback(async (f: File) => {
     if (!f.type.startsWith("video/")) { setSizeError("Only video files allowed"); return; }
-    if (f.size > MAX_VIDEO_MB * 1024 * 1024) {
+    if (MAX_VIDEO_MB > 0 && f.size > MAX_VIDEO_MB * 1024 * 1024) {
       setSizeError(`Max video size is ${MAX_VIDEO_MB} MB`);
       return;
     }
@@ -365,7 +368,7 @@ function VideoDropzone({ onFile, label, hint, error }: VideoDropzoneProps) {
               <p className="text-sm text-gray-300">
                 {isDragging ? "Drop to add video" : "Drag & drop or click to browse"}
               </p>
-              <p className="text-xs text-gray-600 mt-0.5">MP4 · WebM · MKV · MOV · max {MAX_VIDEO_MB} MB</p>
+              <p className="text-xs text-gray-600 mt-0.5">MP4 · WebM · MKV · MOV · No size limit</p>
             </div>
           </>
         )}
@@ -377,8 +380,8 @@ function VideoDropzone({ onFile, label, hint, error }: VideoDropzoneProps) {
 
 // ── MovieUploadForm ────────────────────────────────────────────────────────────
 
-export function MovieUploadForm() {
-  const { account, signAndSubmitTransaction, connected, connect } = useWallet();
+export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string) => void }) {
+  const { account, signAndSubmitTransaction, signMessage, connected, connect } = useWallet();
   const {
     register, handleSubmit, watch, control, setValue,
     formState: { errors },
@@ -402,6 +405,19 @@ export function MovieUploadForm() {
   const [chunkProgress, setChunkProgress] = useState(0);
   const [done, setDone] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [alphaSuccess, setAlphaSuccess] = useState(false);
+  const [countdown, setCountdown] = useState(5);
+
+  useEffect(() => {
+    if (!alphaSuccess) return;
+    const id = setInterval(() => {
+      setCountdown((c) => {
+        if (c <= 1) { clearInterval(id); onSuccess?.("/history"); return 0; }
+        return c - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [alphaSuccess]);
 
   const contentType = watch("type");
   const accessType = watch("accessType");
@@ -423,7 +439,10 @@ export function MovieUploadForm() {
   }
 
   async function onSubmit(values: FormValues) {
-    if (!connected || !account) { setSubmitError("Connect your Petra wallet first"); return; }
+    if (!IS_ALPHA && (!connected || !account)) {
+      setSubmitError("Connect your Petra wallet first");
+      return;
+    }
 
     let valid = true;
     if (!thumbnailFile) { setThumbnailError("Poster image required"); valid = false; }
@@ -440,17 +459,72 @@ export function MovieUploadForm() {
     setMovieFileError(null);
     setDone(false);
 
+    // Alpha mode: fully simulated upload — Petra signMessage + fake 3-stage progress
+    if (IS_ALPHA) {
+      try {
+        if (connected && signMessage) {
+          try {
+            await signMessage({ message: "Authorize upload to Shelby Alpha Node", nonce: Date.now().toString() });
+          } catch {
+            // user cancelled — still proceed with demo
+          }
+        }
+
+        advanceStage(0);
+        await new Promise((r) => setTimeout(r, 900));
+        advanceStage(1);
+        await new Promise((r) => setTimeout(r, 1400));
+        advanceStage(2);
+        await new Promise((r) => setTimeout(r, 700));
+
+        const sessionMovie: MovieDto = {
+          id: `alpha-upload-${Date.now()}`,
+          type: values.type,
+          title: values.title,
+          description: values.description,
+          thumbnailUrl: getRandomAlphaThumbnail(values.title),
+          categories: selectedCategories,
+          priceAPT: parseFloat(values.priceApt) || 0,
+          accessType: values.accessType,
+          isFeatured: values.isFeatured ?? false,
+          status: "written",
+          createdAt: new Date().toISOString(),
+          durationSeconds: values.durationSeconds || 0,
+          previewDuration: values.previewDuration || 0,
+          creatorAddress: account?.address ?? "alpha",
+          episodes: [],
+        };
+        const existing: MovieDto[] = JSON.parse(sessionStorage.getItem("alpha_session_uploads") ?? "[]");
+        sessionStorage.setItem("alpha_session_uploads", JSON.stringify([...existing, sessionMovie]));
+
+        setDone(true);
+        setStage(null);
+        setAlphaSuccess(true);
+      } catch {
+        setStage(null);
+      }
+      return;
+    }
+
+    const walletAddress = account!.address;
+    const mockVideoUrl = process.env.NEXT_PUBLIC_MOCK_VIDEO_URL ?? "";
+
     try {
-      // Convert APT → Octas (u64) for the payment gateway.
-      // register_blob itself doesn't carry movie price — this goes to the API metadata.
       const priceAPT = parseFloat(values.priceApt) || 0;
       const priceOctas = Math.round(priceAPT * APT_TO_OCTAS);
 
       if (values.type === "movie") {
         advanceStage(0);
-        const blobId = await uploadBlob(movieFile!, account.address, signAndSubmitTransaction, (pct) => {
-          if (stageIndex === 2) setChunkProgress(pct);
-        });
+
+        let blobId: string;
+        if (IS_ALPHA) {
+          blobId = mockVideoUrl || `alpha-mock-${Date.now()}`;
+        } else {
+          blobId = await uploadBlob(movieFile!, walletAddress, signAndSubmitTransaction, (pct) => {
+            if (stageIndex === 2) setChunkProgress(pct);
+          });
+        }
+
         advanceStage(2);
 
         const movieRes = await fetch(`${API_URL}/api/movies`, {
@@ -466,10 +540,11 @@ export function MovieUploadForm() {
             priceOctas,
             accessType: values.accessType,
             isFeatured: values.isFeatured ?? false,
-            creatorAddress: account.address,
+            creatorAddress: walletAddress,
             durationSeconds: values.durationSeconds || 0,
             previewDuration: values.previewDuration || 0,
             blobName: blobId,
+            status: "written",
           }),
         });
         if (!movieRes.ok) throw new Error("Failed to save movie metadata");
@@ -477,9 +552,16 @@ export function MovieUploadForm() {
         const episodeBlobs = await Promise.all(
           values.episodes.map(async (ep, idx) => {
             advanceStage(idx % 3 as 0 | 1 | 2);
-            const blobId = await uploadBlob(episodeFiles[idx], account.address, signAndSubmitTransaction, (pct) => {
-              setChunkProgress(pct);
-            });
+
+            let blobId: string;
+            if (IS_ALPHA) {
+              blobId = mockVideoUrl || `alpha-mock-ep${ep.episodeNumber}-${Date.now()}`;
+            } else {
+              blobId = await uploadBlob(episodeFiles[idx], walletAddress, signAndSubmitTransaction, (pct) => {
+                setChunkProgress(pct);
+              });
+            }
+
             return { episodeNumber: ep.episodeNumber, title: ep.title, blobName: blobId, duration: ep.duration };
           })
         );
@@ -497,9 +579,10 @@ export function MovieUploadForm() {
             priceOctas,
             accessType: values.accessType,
             isFeatured: values.isFeatured ?? false,
-            creatorAddress: account.address,
+            creatorAddress: walletAddress,
             previewDuration: values.previewDuration || 0,
             episodes: episodeBlobs,
+            status: "written",
           }),
         });
         if (!movieRes.ok) throw new Error("Failed to save series metadata");
@@ -523,7 +606,7 @@ export function MovieUploadForm() {
     (contentType === "series" || movieFile !== null);
 
   // ── Wallet guard ──────────────────────────────────────────────────────────
-  if (!connected) {
+  if (!IS_ALPHA && !connected) {
     return (
       <div className="flex flex-col items-center justify-center gap-6 py-16 text-center max-w-xl">
         <div className="w-14 h-14 rounded-full bg-brand/10 border border-brand/20 flex items-center justify-center">
@@ -546,9 +629,50 @@ export function MovieUploadForm() {
     );
   }
 
+  if (alphaSuccess) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-6 py-16 text-center max-w-xl mx-auto">
+        <div className="relative">
+          <div className="w-24 h-24 rounded-full bg-green-500/10 border-2 border-green-500/30 flex items-center justify-center animate-scale-in">
+            <CheckCircle className="w-12 h-12 text-green-400" />
+          </div>
+          <div className="absolute inset-0 rounded-full border-2 border-green-400/20 animate-ping" />
+        </div>
+        <div className="space-y-2">
+          <h3 className="text-2xl font-bold text-white">Movie Published Successfully!</h3>
+          <p className="text-gray-400 text-sm max-w-sm">Your movie is now live on the Shelby Alpha Node.</p>
+        </div>
+        <div className="flex gap-3">
+          <button
+            onClick={() => onSuccess?.("/")}
+            className="px-6 py-2.5 rounded-lg bg-brand text-white font-semibold text-sm hover:bg-brand-dark transition-colors"
+          >
+            Go to Home
+          </button>
+          <button
+            onClick={() => onSuccess?.("/history")}
+            className="px-6 py-2.5 rounded-lg bg-white/10 text-gray-300 font-semibold text-sm hover:bg-white/20 transition-colors"
+          >
+            View in Library
+          </button>
+        </div>
+        <p className="text-xs text-gray-600">Redirecting to Library in {countdown}s…</p>
+      </div>
+    );
+  }
+
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6 max-w-xl">
       <h2 className="text-xl font-bold text-white">Creator Studio</h2>
+
+      {IS_ALPHA && (
+        <div className="flex items-start gap-3 px-4 py-3 rounded-lg bg-amber-500/10 border border-amber-500/30">
+          <span className="text-amber-400 text-xs font-bold mt-0.5 shrink-0">ALPHA</span>
+          <p className="text-amber-300/80 text-xs leading-relaxed">
+            Alpha demo mode — a Petra signature request simulates on-chain registration. No real APT is spent.
+          </p>
+        </div>
+      )}
 
       {/* Content type — segmented control */}
       <div>
@@ -662,7 +786,7 @@ export function MovieUploadForm() {
         <div className="space-y-2">
           <VideoDropzone
             label="Video File"
-            hint={`MP4/WebM · max ${MAX_VIDEO_MB} MB`}
+            hint="MP4 · WebM · MKV · No size limit"
             onFile={(file, duration) => {
               setMovieFile(file);
               setMovieFileError(null);
@@ -807,7 +931,7 @@ export function MovieUploadForm() {
                 className="w-full bg-gray-700 text-white rounded px-3 py-1.5 text-sm"
               />
               <VideoDropzone
-                hint={`MP4/WebM · max ${MAX_VIDEO_MB} MB`}
+                hint="MP4 · WebM · MKV · No size limit"
                 onFile={(file, duration) => {
                   setEpisodeFiles((prev) => file ? { ...prev, [idx]: file } : { ...prev });
                   if (duration > 0) setValue(`episodes.${idx}.duration`, duration);
@@ -847,16 +971,23 @@ export function MovieUploadForm() {
               </div>
             ))}
           </div>
-          {stageIndex === 2 && (
+          {stageIndex === 2 && !IS_ALPHA && (
             <p className="text-sm text-gray-400 text-center">{chunkProgress}% uploaded</p>
           )}
         </div>
       )}
 
       {done && (
-        <div className="flex items-center gap-2 px-4 py-3 rounded-lg bg-green-500/10 border border-green-500/30">
-          <CheckCircle className="w-4 h-4 text-green-400" />
-          <p className="text-sm text-green-400 font-medium">Published successfully!</p>
+        <div className="flex items-start gap-3 px-4 py-3 rounded-lg bg-green-500/10 border border-green-500/30">
+          <CheckCircle className="w-4 h-4 text-green-400 mt-0.5 shrink-0" />
+          <div>
+            <p className="text-sm text-green-400 font-medium">Published successfully!</p>
+            {IS_ALPHA && (
+              <p className="text-xs text-green-500/70 mt-0.5">
+                Movie Registered on Shelby (Alpha Node) — Transaction Simulated
+              </p>
+            )}
+          </div>
         </div>
       )}
 

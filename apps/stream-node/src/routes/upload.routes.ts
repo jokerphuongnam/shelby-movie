@@ -2,8 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import * as uploadController from "../controllers/upload.controller";
 
-// Store chunks in memory — for production consider disk storage for very large files
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 * 1024 } });
 
 const router = Router();
 

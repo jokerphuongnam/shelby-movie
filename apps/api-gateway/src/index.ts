@@ -4,9 +4,11 @@ import { connectNats } from "./nats/publisher";
 import movieRouter from "./routes/movie.routes";
 import paymentRouter from "./routes/payment.routes";
 import accessRouter from "./routes/access.routes";
+import adminRouter, { seedIfEmpty } from "./routes/admin.routes";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
 const corsOrigin = process.env.CORS_ORIGIN ?? "*";
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -22,6 +24,7 @@ app.get("/health", (_req: Request, res: Response) => res.json({ status: "ok" }))
 app.use("/api/movies", movieRouter);
 app.use("/api/payment", paymentRouter);
 app.use("/api/access", accessRouter);
+app.use("/api/admin", adminRouter);
 
 async function bootstrap() {
   await mongoose.connect(process.env.MONGO_URI!, {
@@ -30,6 +33,10 @@ async function bootstrap() {
     socketTimeoutMS: 45000,
   });
   console.log("MongoDB connected");
+
+  if (process.env.ALPHA_SEED === "true") {
+    await seedIfEmpty();
+  }
 
   await connectNats();
 

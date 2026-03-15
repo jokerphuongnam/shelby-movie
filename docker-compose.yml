@@ -9,6 +9,7 @@ services:
       - MONGO_URI=mongodb://mongodb:27017/shelbymovie
       - NATS_URL=nats://nats-server:4222
       - PORT=3000
+      - ALPHA_SEED=${ALPHA_SEED:-false}
     ports:
       - "8080:3000"
     depends_on:
@@ -22,6 +23,10 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
     networks:
       - shelby-net
     restart: unless-stopped
@@ -46,6 +51,10 @@ services:
         condition: service_healthy
       nats-server:
         condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 4g
     networks:
       - shelby-net
     restart: unless-stopped
@@ -112,7 +121,9 @@ services:
         max-size: "5m"
         max-file: "3"
 
-  frontend:
+  # Production / on-chain mode — ./run.sh dev  (--profile onchain)
+  # Accessible at http://localhost:4545 and proxied via nginx on port 80
+  frontend-onchain:
     build:
       context: .
       dockerfile: apps/frontend/Dockerfile
@@ -127,9 +138,58 @@ services:
         NEXT_PUBLIC_SHELBY_API_KEY: ${NEXT_PUBLIC_SHELBY_API_KEY:-}
         NEXT_PUBLIC_APT_PRICE_MULTIPLIER: ${NEXT_PUBLIC_APT_PRICE_MULTIPLIER:-0.5}
         NEXT_PUBLIC_TREASURY_ADDRESS: ${NEXT_PUBLIC_TREASURY_ADDRESS:-0x0}
-    container_name: frontend
+        NEXT_PUBLIC_ALPHA_TEST: "false"
+        NEXT_PUBLIC_MOCK_VIDEO_URL: ""
+    container_name: frontend-onchain
+    environment:
+      INTERNAL_API_URL: http://api-gateway:3000
+    profiles:
+      - onchain
+    depends_on:
+      api-gateway:
+        condition: service_healthy
     ports:
       - "4545:3000"
+    networks:
+      shelby-net:
+        aliases:
+          - frontend
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Alpha test environment — off-chain mode, no Petra wallet required
+  # Start with: docker-compose --env-file .env.alpha --profile alpha up frontend-alpha
+  frontend-alpha:
+    build:
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      args:
+        CACHE_BUST: ${CACHE_BUST:-1}
+        NEXT_PUBLIC_API_URL: http://localhost:8080
+        NEXT_PUBLIC_STREAM_URL: http://localhost
+        NEXT_PUBLIC_APTOS_NETWORK: testnet
+        NEXT_PUBLIC_APTOS_NODE_URL: https://api.shelbynet.shelby.xyz/shelby
+        NEXT_PUBLIC_SHELBY_CONTRACT: ${NEXT_PUBLIC_SHELBY_CONTRACT:-0x85fdb9a176ab8ef1d9d9c1b60d60b3924f0800ac1de1cc2085fb0b8bb4988e6a}
+        NEXT_PUBLIC_SHELBY_API_KEY: ${NEXT_PUBLIC_SHELBY_API_KEY:-}
+        NEXT_PUBLIC_APT_PRICE_MULTIPLIER: ${NEXT_PUBLIC_APT_PRICE_MULTIPLIER:-0.5}
+        NEXT_PUBLIC_TREASURY_ADDRESS: ${NEXT_PUBLIC_TREASURY_ADDRESS:-0x0}
+        NEXT_PUBLIC_ALPHA_TEST: "true"
+        NEXT_PUBLIC_MOCK_VIDEO_URL: ${NEXT_PUBLIC_MOCK_VIDEO_URL:-https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4}
+    container_name: frontend-alpha
+    environment:
+      # Runtime var for Next.js server components — not baked into client bundle
+      INTERNAL_API_URL: http://api-gateway:3000
+    profiles:
+      - alpha
+    ports:
+      - "4546:3000"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
     networks:
       - shelby-net
     restart: unless-stopped
@@ -142,6 +202,8 @@ services:
   nginx:
     image: nginx:1.25-alpine
     container_name: nginx
+    profiles:
+      - onchain
     ports:
       - "80:80"
     volumes:
@@ -151,7 +213,7 @@ services:
         condition: service_healthy
       stream-node:
         condition: service_started
-      frontend:
+      frontend-onchain:
         condition: service_started
     networks:
       - shelby-net
