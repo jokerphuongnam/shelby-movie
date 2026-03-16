@@ -9,7 +9,7 @@ import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import { NavHeader } from "@/components/layout/NavHeader";
 import { Play, BookOpen, Upload, Clock, CheckCircle, Loader2, Trash2 } from "lucide-react";
 import type { AccessDto, MovieDto, ProgressDto } from "@shelby-movie/shared-types";
-import { ALPHA_MOVIES, getRandomAlphaThumbnail } from "@/lib/alpha-data";
+import { ALPHA_MOVIES, getRandomAlphaThumbnail, getAlphaPurchased } from "@/lib/alpha-data";
 
 const IS_ALPHA = process.env.NEXT_PUBLIC_ALPHA_TEST === "true";
 
@@ -247,11 +247,14 @@ export default function LibraryPage() {
 
   useEffect(() => {
     if (IS_ALPHA) {
-      const alphaEntries: LibraryEntry[] = ALPHA_MOVIES.map((m) => ({
-        access: { id: m.id, movieId: m.id, txHash: `alpha-${m.id}`, lastWatched: null, createdAt: m.createdAt },
-        movie: m,
-        progress: null,
-      }));
+      const purchasedIds = getAlphaPurchased();
+      const alphaEntries: LibraryEntry[] = ALPHA_MOVIES
+        .filter((m) => m.accessType === "free" || purchasedIds.includes(m.id))
+        .map((m) => ({
+          access: { id: m.id, movieId: m.id, txHash: `alpha-${m.id}`, lastWatched: null, createdAt: m.createdAt },
+          movie: m,
+          progress: null,
+        }));
       setPurchased(alphaEntries);
       try {
         const sessionUploads: MovieDto[] = JSON.parse(sessionStorage.getItem("alpha_session_uploads") ?? "[]");
@@ -401,7 +404,7 @@ export default function LibraryPage() {
                 <EmptyState
                   icon={<BookOpen className="w-7 h-7 text-gray-500" />}
                   title="No purchases yet"
-                  body="Films you buy on Shelby Protocol will appear here."
+                  body={IS_ALPHA ? "Unlock a paid film on the watch page to see it here." : "Films you buy on Shelby Protocol will appear here."}
                   cta="Browse Movies"
                   ctaHref="/"
                 />
@@ -417,6 +420,8 @@ export default function LibraryPage() {
                       ? `${fmtSeconds(progress.lastPosition)} watched`
                       : access.lastWatched
                       ? `Owned · ${new Date(access.lastWatched).toLocaleDateString()}`
+                      : IS_ALPHA && movie.accessType === "paid"
+                      ? "Purchased"
                       : "Not started";
 
                     return (

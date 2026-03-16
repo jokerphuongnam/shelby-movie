@@ -2,6 +2,8 @@ import { notFound } from "next/navigation";
 import Link from "next/link";
 import type { MovieDto } from "@shelby-movie/shared-types";
 import { ALPHA_MOVIES } from "@/lib/alpha-data";
+import { ALPHA_VIDEO_MAP } from "@/lib/alpha-data.server";
+import { issueStreamToken } from "@/lib/stream-token.server";
 import { MovieWatch } from "@/components/movie/MovieWatch";
 import { WalletButton } from "@/components/wallet/WalletButton";
 
@@ -27,14 +29,14 @@ interface WatchPageProps {
 
 export default async function WatchPage({ params, searchParams }: WatchPageProps) {
   let movie: MovieDto | null;
-  let alphaVideoUrl: string | undefined;
+  let alphaStreamToken: string | undefined;
 
   if (IS_ALPHA) {
     const alphaMovie = ALPHA_MOVIES.find((m) => m.id === params.id);
-    if (!alphaMovie) return notFound();
-    const { videoUrl, ...dto } = alphaMovie;
-    movie = dto;
-    alphaVideoUrl = videoUrl;
+    if (!alphaMovie || !ALPHA_VIDEO_MAP[params.id]) return notFound();
+    movie = alphaMovie;
+    // Issue a short-lived signed token — the actual video URL stays server-side
+    alphaStreamToken = issueStreamToken(params.id);
   } else {
     movie = await fetchMovie(params.id);
     if (!movie) return notFound();
@@ -52,7 +54,7 @@ export default async function WatchPage({ params, searchParams }: WatchPageProps
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-10">
-        <MovieWatch movie={movie} alphaVideoUrl={alphaVideoUrl} initialEpisode={episode} />
+        <MovieWatch movie={movie} alphaStreamToken={alphaStreamToken} initialEpisode={episode} />
       </main>
     </div>
   );

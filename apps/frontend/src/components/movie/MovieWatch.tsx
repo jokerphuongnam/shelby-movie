@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
 import type { MovieDto } from "@shelby-movie/shared-types";
+import { getAlphaPurchased, saveAlphaPurchase } from "@/lib/alpha-data";
 import { VideoPlayer } from "./VideoPlayer";
 import { EpisodeSidebar } from "./EpisodeSidebar";
 
@@ -20,7 +21,7 @@ const IS_ALPHA = process.env.NEXT_PUBLIC_ALPHA_TEST === "true";
 
 interface MovieWatchProps {
   movie: MovieDto;
-  alphaVideoUrl?: string;
+  alphaStreamToken?: string;
   initialEpisode?: number;
 }
 
@@ -30,8 +31,24 @@ function formatSeconds(s: number) {
   return `${m}:${String(sec).padStart(2, "0")}`;
 }
 
-export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWatchProps) {
+function calcAlphaPreview(durationSeconds: number): number {
+  if (durationSeconds < 300) return 30;
+  return Math.min(Math.floor(durationSeconds * 0.1), 120);
+}
+
+export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: MovieWatchProps) {
+  // Derive these before hooks so they can be used in lazy state initializers
+  const isFree = movie.accessType === "free";
+  const isSeries = movie.type === "series" && movie.episodes.length > 0;
+
   const { account, signAndSubmitTransaction, signMessage, connected } = useWallet();
+
+  // isPurchased: true for free movies always; for paid alpha movies, check sessionStorage
+  const [isPurchased, setIsPurchased] = useState<boolean>(() => {
+    if (!IS_ALPHA || isFree) return true;
+    return getAlphaPurchased().includes(movie.id);
+  });
+
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [directVideoUrl, setDirectVideoUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -41,12 +58,22 @@ export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWa
   const [progressLoaded, setProgressLoaded] = useState(false);
   const [episode, setEpisode] = useState(initialEpisode);
   const [showPaywall, setShowPaywall] = useState(false);
-  const [alphaToast, setAlphaToast] = useState(false);
+  const [purchaseToast, setPurchaseToast] = useState(false);
   const [resumePosition, setResumePosition] = useState<number | null>(null);
+  const [bgPurchaseLoading, setBgPurchaseLoading] = useState(false);
+  const [showStickyBar, setShowStickyBar] = useState(false);
 
-  const isFree = movie.accessType === "free";
-  const isSeries = movie.type === "series" && movie.episodes.length > 0;
+  useEffect(() => {
+    const onScroll = () => setShowStickyBar(window.scrollY > 80);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
   const previewDuration = !isFree && !IS_ALPHA ? movie.previewDuration : undefined;
+  const alphaPreviewLimit =
+    IS_ALPHA && !isFree && !isPurchased && movie.durationSeconds
+      ? calcAlphaPreview(movie.durationSeconds)
+      : undefined;
 
   useEffect(() => {
     setEpisode(initialEpisode);
@@ -85,13 +112,12 @@ export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWa
   }, [sessionToken, progressLoaded, initialPosition]);
 
   async function grantAccess() {
-    // Alpha + direct URL: free movies auto-play; paid movies wait for user action
-    if (IS_ALPHA && alphaVideoUrl) {
-      if (isFree) {
-        setDirectVideoUrl(alphaVideoUrl);
-        setSessionToken("alpha-free");
-      }
-      // Paid movies: leave sessionToken null — alpha paywall gate renders
+    if (IS_ALPHA && alphaStreamToken) {
+      const alreadyPurchased = isFree || getAlphaPurchased().includes(movie.id);
+      // Proxy URL — the real video URL never leaves the server
+      setDirectVideoUrl(`/api/stream/${movie.id}?token=${alphaStreamToken}`);
+      setSessionToken(alreadyPurchased ? (isFree ? "alpha-free" : "alpha-paid") : "alpha-preview");
+      if (alreadyPurchased && !isFree) setIsPurchased(true);
       setLoading(false);
       return;
     }
@@ -99,7 +125,7 @@ export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWa
     setLoading(true);
     setError(null);
     try {
-      const endpoint = (isFree || IS_ALPHA) ? `${API}/api/access/free` : `${API}/api/access/preview`;
+      const endpoint = isFree ? `${API}/api/access/free` : `${API}/api/access/preview`;
       const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -119,33 +145,33 @@ export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWa
   }
 
   async function handleAlphaPurchase() {
-    setLoading(true);
-    setError(null);
-    try {
-      if (connected && account && signMessage) {
-        setTxStep("signing");
+    if (signMessage) {
+      try {
         await signMessage({
-          message: `Alpha Demo — Authorize access to "${movie.title}"`,
+          message: `Purchasing access to "${movie.title}" — ${movie.priceAPT.toFixed(2)} APT`,
           nonce: Date.now().toString(),
         });
-        setTxStep(null);
+      } catch {
+        // cancelled — still grant in demo mode
       }
-      setDirectVideoUrl(alphaVideoUrl!);
-      setSessionToken("alpha-paid");
-      setAlphaToast(true);
-      setTimeout(() => setAlphaToast(false), 4000);
-    } catch (err: any) {
-      setTxStep(null);
-      // User cancelled Petra — still allow playback in demo mode
-      if (err?.message?.toLowerCase().includes("cancel") || err?.message?.toLowerCase().includes("reject")) {
-        setDirectVideoUrl(alphaVideoUrl!);
-        setSessionToken("alpha-paid");
-      } else {
-        setError(err.message ?? "Signing failed");
-      }
+    }
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    saveAlphaPurchase(movie.id);
+    setIsPurchased(true);
+    setSessionToken("alpha-paid");
+    setPurchaseToast(true);
+    setTimeout(() => setPurchaseToast(false), 4000);
+  }
+
+  async function handleBackgroundPurchase() {
+    if (bgPurchaseLoading || isPurchased) return;
+    setBgPurchaseLoading(true);
+    try {
+      await handleAlphaPurchase();
     } finally {
-      setLoading(false);
-      setTxStep(null);
+      setBgPurchaseLoading(false);
     }
   }
 
@@ -199,67 +225,81 @@ export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWa
 
   return (
     <div className="space-y-6">
-      {alphaToast && (
-        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2.5 px-5 py-3 rounded-xl bg-green-600 text-white text-sm font-semibold shadow-2xl animate-fade-in">
-          <span>✓</span> Alpha Mode: Transaction Bypassed Successfully
+      {purchaseToast && (
+        <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[200] flex items-center gap-2.5 px-5 py-3 rounded-xl bg-green-600 text-white text-sm font-semibold shadow-2xl animate-toast-in whitespace-nowrap">
+          <span>✓</span> Full version unlocked! Enjoy the rest of the film.
         </div>
       )}
 
-      <div>
-        <h1 className="text-3xl font-bold text-white">{movie.title}</h1>
-        {isSeries && (
-          <p className="text-gray-400 text-sm mt-1">
-            Season 1 · Episode {episode}
-            {currentEpisodeTitle && ` — ${currentEpisodeTitle}`}
-          </p>
-        )}
-        <div className="flex flex-wrap gap-2 mt-2">
-          {movie.categories.map((c) => (
-            <span key={c} className="text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300">{c}</span>
-          ))}
-          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${isFree ? "bg-green-600/30 text-green-400" : "bg-brand/20 text-brand"}`}>
-            {isFree ? "Free" : `${movie.priceAPT.toFixed(2)} APT`}
-          </span>
-          {IS_ALPHA && !isFree && (
-            <span className="text-xs px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-400 font-medium">Demo</span>
-          )}
+      {/* Sticky purchase bar — appears on scroll */}
+      {showStickyBar && IS_ALPHA && !isFree && !isPurchased && (
+        <div className="fixed top-0 left-0 right-0 z-[100] bg-black/95 backdrop-blur-sm border-b border-white/10 px-6 py-3 flex items-center justify-between gap-4">
+          <p className="text-white font-semibold text-sm truncate">{movie.title}</p>
+          <button
+            onClick={handleBackgroundPurchase}
+            disabled={bgPurchaseLoading}
+            title="Unlock the full movie now to enjoy without interruptions."
+            className="flex items-center gap-2 px-5 py-2 rounded-lg bg-brand text-white text-sm font-bold hover:bg-brand-dark transition-colors disabled:opacity-60 shrink-0"
+          >
+            {bgPurchaseLoading ? (
+              <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> Unlocking…</>
+            ) : (
+              <><span>▶</span> Purchase — {movie.priceAPT.toFixed(2)} APT</>
+            )}
+          </button>
         </div>
-        <p className="text-gray-400 mt-3 text-sm leading-relaxed">{movie.description}</p>
+      )}
+
+      {/* Title row — purchase button lives here as the primary CTA */}
+      <div className="flex items-start justify-between gap-6">
+        <div className="flex-1 min-w-0">
+          <h1 className="text-3xl font-bold text-white">{movie.title}</h1>
+          {isSeries && (
+            <p className="text-gray-400 text-sm mt-1">
+              Season 1 · Episode {episode}
+              {currentEpisodeTitle && ` — ${currentEpisodeTitle}`}
+            </p>
+          )}
+          <div className="flex flex-wrap gap-2 mt-2">
+            {movie.categories.map((c) => (
+              <span key={c} className="text-xs px-2 py-0.5 rounded-full bg-white/10 text-gray-300">{c}</span>
+            ))}
+            <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${isFree ? "bg-green-600/30 text-green-400" : "bg-brand/20 text-brand"}`}>
+              {isFree ? "Free" : `${movie.priceAPT.toFixed(2)} APT`}
+            </span>
+            {IS_ALPHA && !isFree && isPurchased && (
+              <span className="text-xs px-2 py-0.5 rounded-full bg-green-600/20 text-green-400 font-medium">✓ Owned</span>
+            )}
+          </div>
+          <p className="text-gray-400 mt-3 text-sm leading-relaxed">{movie.description}</p>
+        </div>
+
+        {IS_ALPHA && !isFree && !isPurchased && (
+          <div className="flex-shrink-0 flex flex-col items-end gap-2 pt-1">
+            <button
+              onClick={handleBackgroundPurchase}
+              disabled={bgPurchaseLoading}
+              title="Unlock the full movie now to enjoy without interruptions."
+              className="flex items-center gap-2.5 px-6 py-3 rounded-lg bg-brand text-white font-bold text-sm hover:bg-brand-dark transition-colors disabled:opacity-60 whitespace-nowrap shadow-lg shadow-brand/20"
+            >
+              {bgPurchaseLoading ? (
+                <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> Unlocking…</>
+              ) : (
+                <><span>▶</span> Purchase Full Movie — {movie.priceAPT.toFixed(2)} APT</>
+              )}
+            </button>
+            {alphaPreviewLimit && (
+              <p className="text-xs text-amber-400/70">Free preview · first {alphaPreviewLimit}s</p>
+            )}
+            {IS_ALPHA && (
+              <p className="text-[10px] text-gray-600">Simulated — no real APT required</p>
+            )}
+          </div>
+        )}
       </div>
 
       <div className={`flex gap-6 ${isSeries && sessionToken ? "items-start" : ""}`}>
         <div className="flex-1 min-w-0">
-          {/* Alpha paid gate — shown for paid movies in alpha before user signs */}
-          {IS_ALPHA && !isFree && !sessionToken && (
-            <div className="aspect-video rounded-xl bg-gradient-to-br from-black/80 to-black/60 border border-white/[0.08] flex flex-col items-center justify-center gap-5">
-              <div className="space-y-1.5 text-center px-8">
-                <p className="text-white font-bold text-xl">{movie.title}</p>
-                <p className="text-gray-400 text-sm">
-                  {movie.priceAPT.toFixed(2)} APT · Simulated transaction — no real APT required
-                </p>
-              </div>
-              {txStep === "signing" ? (
-                <div className="flex flex-col items-center gap-3">
-                  <div className="w-7 h-7 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
-                  <p className="text-amber-400 text-sm font-medium">Confirm in your Petra wallet…</p>
-                </div>
-              ) : (
-                <>
-                  <button
-                    onClick={handleAlphaPurchase}
-                    disabled={loading}
-                    className="flex items-center gap-2.5 px-8 py-3.5 rounded-lg bg-brand text-white font-bold text-sm hover:bg-brand-dark transition-colors disabled:opacity-50"
-                  >
-                    <span>▶</span> Watch Now — Demo
-                  </button>
-                  {!connected && (
-                    <p className="text-gray-500 text-xs">Connect Petra to trigger a simulated signature</p>
-                  )}
-                  {error && <p className="text-red-400 text-xs">{error}</p>}
-                </>
-              )}
-            </div>
-          )}
 
           {loading && !sessionToken && !IS_ALPHA && (
             <div className="aspect-video rounded-xl bg-black/60 flex flex-col items-center justify-center gap-3">
@@ -293,11 +333,16 @@ export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWa
                 directUrl={directVideoUrl ?? undefined}
                 initialPosition={resumePosition}
                 movieId={movie.id}
+                movieTitle={movie.title}
                 episodeNumber={episode}
                 creatorAddress={movie.creatorAddress}
                 priceAPT={movie.priceAPT}
                 previewDuration={previewDuration}
                 onPreviewEnd={handlePreviewEnd}
+                isPurchased={isPurchased}
+                alphaPreviewLimit={alphaPreviewLimit}
+                onPurchase={IS_ALPHA && !isFree ? handleAlphaPurchase : undefined}
+                purchasePending={bgPurchaseLoading}
               />
 
               {showPaywall && !IS_ALPHA && (
@@ -315,7 +360,7 @@ export function MovieWatch({ movie, alphaVideoUrl, initialEpisode = 1 }: MovieWa
                       <p className="text-gray-400 text-sm">Unlock the full movie to keep watching</p>
                       {error && <p className="text-red-400 text-sm">{error}</p>}
                       <button onClick={handlePurchase} disabled={loading} className="flex items-center gap-2 px-8 py-3 rounded bg-brand text-white font-bold hover:bg-brand-dark transition disabled:opacity-50">
-                        <span>▶</span> Unlock for {movie.priceAPT.toFixed(2)} APT
+                        <span>▶</span> Unlock Movie — {movie.priceAPT.toFixed(2)} APT
                       </button>
                       {!connected && <p className="text-gray-500 text-xs">Connect your Petra wallet to purchase.</p>}
                     </>
