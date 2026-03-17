@@ -15,6 +15,7 @@ COPY apps/stream-node ./apps/stream-node
 RUN pnpm --filter stream-node build
 
 FROM node:20-alpine
+RUN apk add --no-cache ffmpeg
 WORKDIR /app
 RUN npm install -g pnpm
 

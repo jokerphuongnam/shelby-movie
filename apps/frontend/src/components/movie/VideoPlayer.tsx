@@ -107,6 +107,7 @@ export function VideoPlayer({
   useEffect(() => { purchasePendingRef.current = purchasePending; }, [purchasePending]);
 
   const streamUrl = directUrl ?? `${process.env.NEXT_PUBLIC_STREAM_URL}/stream/play?token=${sessionToken}`;
+  const isHls = streamUrl.includes(".m3u8");
 
   useEffect(() => {
     const video = videoRef.current;
@@ -115,6 +116,22 @@ export function VideoPlayer({
     video.addEventListener("loadedmetadata", onMeta);
     return () => video.removeEventListener("loadedmetadata", onMeta);
   }, []);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !isHls) return;
+    let hlsInstance: any;
+    import("hls.js").then(({ default: Hls }) => {
+      if (Hls.isSupported()) {
+        hlsInstance = new Hls();
+        hlsInstance.loadSource(streamUrl);
+        hlsInstance.attachMedia(video);
+      } else {
+        video.src = streamUrl;
+      }
+    });
+    return () => hlsInstance?.destroy();
+  }, [streamUrl, isHls]);
 
   // Seek to resume position once buffered
   useEffect(() => {
@@ -349,7 +366,7 @@ export function VideoPlayer({
           autoPlay
           playsInline
           className="w-full h-full"
-          src={streamUrl}
+          src={isHls ? undefined : streamUrl}
         >
           Your browser does not support the video tag.
         </video>

@@ -71,6 +71,40 @@ function extractVideoDuration(file: File): Promise<number> {
   });
 }
 
+function captureVideoFrame(file: File): Promise<File | null> {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    const url = URL.createObjectURL(file);
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      video.currentTime = Math.min(1, video.duration > 0 ? video.duration * 0.05 : 1);
+    };
+    video.onseeked = () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth || 1280;
+        canvas.height = video.videoHeight || 720;
+        canvas.getContext("2d")?.drawImage(video, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(url);
+            resolve(blob ? new File([blob], "thumbnail.jpg", { type: "image/jpeg" }) : null);
+          },
+          "image/jpeg",
+          0.85,
+        );
+      } catch {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      }
+    };
+    video.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    video.src = url;
+  });
+}
+
 async function uploadBlob(
   videoFile: File,
   walletAddress: string,
@@ -138,14 +172,23 @@ async function uploadBlob(
 
 interface ThumbnailDropzoneProps {
   onFile: (file: File | null) => void;
+  capturedFrame?: File | null;
   error?: string;
 }
 
-function ThumbnailDropzone({ onFile, error }: ThumbnailDropzoneProps) {
+function ThumbnailDropzone({ onFile, capturedFrame, error }: ThumbnailDropzoneProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [preview, setPreview] = useState<string | null>(null);
+  const [capturedPreviewUrl, setCapturedPreviewUrl] = useState<string | null>(null);
   const [sizeError, setSizeError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!capturedFrame) { setCapturedPreviewUrl(null); return; }
+    const url = URL.createObjectURL(capturedFrame);
+    setCapturedPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [capturedFrame]);
 
   const handle = useCallback((f: File) => {
     if (!f.type.startsWith("image/")) { setSizeError("Only image files allowed"); return; }
@@ -183,7 +226,7 @@ function ThumbnailDropzone({ onFile, error }: ThumbnailDropzoneProps) {
     <div>
       <div className="flex items-baseline justify-between mb-1.5">
         <p className="text-sm text-gray-400">
-          Poster / Thumbnail <span className="text-red-500">*</span>
+          Poster / Thumbnail <span className="text-gray-600 text-xs">(optional)</span>
         </p>
         <p className="text-xs text-gray-600">1280×720 recommended</p>
       </div>
@@ -199,6 +242,17 @@ function ThumbnailDropzone({ onFile, error }: ThumbnailDropzoneProps) {
           </button>
           <div className="absolute bottom-0 left-0 right-0 h-8 bg-gradient-to-t from-black/60 to-transparent rounded-b-xl flex items-end justify-center pb-1">
             <p className="text-xs text-white/70">Click to change</p>
+          </div>
+          <button type="button" onClick={() => inputRef.current?.click()} className="absolute inset-0" />
+          <input ref={inputRef} type="file" accept="image/*" className="hidden"
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) handle(f); }} />
+        </div>
+      ) : capturedPreviewUrl ? (
+        <div className="relative w-36 group">
+          <img src={capturedPreviewUrl} alt="Auto-captured thumbnail" className="w-full aspect-[2/3] object-cover rounded-xl opacity-80" />
+          <span className="absolute top-2 left-2 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/80 text-white font-medium">Auto</span>
+          <div className="absolute bottom-0 left-0 right-0 h-8 bg-gradient-to-t from-black/60 to-transparent rounded-b-xl flex items-end justify-center pb-1">
+            <p className="text-xs text-white/70">Click to replace</p>
           </div>
           <button type="button" onClick={() => inputRef.current?.click()} className="absolute inset-0" />
           <input ref={inputRef} type="file" accept="image/*" className="hidden"
@@ -393,6 +447,7 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
     useFieldArray({ control, name: "episodes" });
 
   const [thumbnailFile, setThumbnailFile] = useState<File | null>(null);
+  const [capturedFrameFile, setCapturedFrameFile] = useState<File | null>(null);
   const [thumbnailError, setThumbnailError] = useState<string | null>(null);
   const [selectedCategories, setSelectedCategories] = useState<string[]>([]);
   const [categoryError, setCategoryError] = useState<string | null>(null);
@@ -445,7 +500,6 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
     }
 
     let valid = true;
-    if (!thumbnailFile) { setThumbnailError("Poster image required"); valid = false; }
     if (selectedCategories.length === 0) { setCategoryError("Select at least one category"); valid = false; }
     if (values.type === "movie" && !movieFile) { setMovieFileError("Video file required"); valid = false; }
     if (values.type === "series" && episodeFields.some((_, i) => !episodeFiles[i])) {
@@ -482,7 +536,11 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
           type: values.type,
           title: values.title,
           description: values.description,
-          thumbnailUrl: getRandomAlphaThumbnail(values.title),
+          thumbnailUrl: thumbnailFile
+            ? URL.createObjectURL(thumbnailFile)
+            : capturedFrameFile
+            ? URL.createObjectURL(capturedFrameFile)
+            : getRandomAlphaThumbnail(values.title),
           categories: selectedCategories,
           priceAPT: parseFloat(values.priceApt) || 0,
           accessType: values.accessType,
@@ -534,7 +592,7 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
             type: "movie",
             title: values.title,
             description: values.description,
-            thumbnailUrl: URL.createObjectURL(thumbnailFile!),
+            thumbnailUrl: URL.createObjectURL(thumbnailFile ?? capturedFrameFile!),
             categories: selectedCategories,
             priceAPT,
             priceOctas,
@@ -573,7 +631,7 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
             type: "series",
             title: values.title,
             description: values.description,
-            thumbnailUrl: URL.createObjectURL(thumbnailFile!),
+            thumbnailUrl: URL.createObjectURL(thumbnailFile ?? capturedFrameFile!),
             categories: selectedCategories,
             priceAPT,
             priceOctas,
@@ -601,7 +659,6 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
   // Submit is ready when all required out-of-RHF state is present
   const isReady =
     !isUploading &&
-    thumbnailFile !== null &&
     selectedCategories.length > 0 &&
     (contentType === "series" || movieFile !== null);
 
@@ -722,6 +779,7 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
       {/* Thumbnail dropzone */}
       <ThumbnailDropzone
         onFile={(file) => { setThumbnailFile(file); if (file) setThumbnailError(null); }}
+        capturedFrame={capturedFrameFile}
         error={thumbnailError ?? undefined}
       />
 
@@ -791,6 +849,11 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
               setMovieFile(file);
               setMovieFileError(null);
               setValue("durationSeconds", duration > 0 ? duration : 0);
+              if (file && !thumbnailFile) {
+                captureVideoFrame(file).then((frame) => setCapturedFrameFile(frame));
+              } else if (!file) {
+                setCapturedFrameFile(null);
+              }
             }}
             error={movieFileError ?? undefined}
           />
@@ -1009,8 +1072,7 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
 
       {!isReady && !isUploading && (
         <p className="text-center text-xs text-gray-600">
-          {!thumbnailFile ? "Add a thumbnail" :
-           selectedCategories.length === 0 ? "Select a category" :
+          {selectedCategories.length === 0 ? "Select a category" :
            contentType === "movie" && !movieFile ? "Add a video file" :
            "Fill in all required fields"} to continue
         </p>
