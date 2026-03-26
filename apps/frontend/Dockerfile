@@ -2,11 +2,11 @@ FROM node:20-alpine AS builder
 RUN npm install -g pnpm
 WORKDIR /app
 
-COPY package.json pnpm-workspace.yaml ./
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY packages/shared-types/package.json ./packages/shared-types/
 COPY apps/frontend/package.json ./apps/frontend/
 
-RUN pnpm install
+RUN pnpm install --frozen-lockfile
 
 COPY packages/shared-types ./packages/shared-types
 COPY apps/frontend ./apps/frontend
@@ -44,10 +44,10 @@ FROM node:20-alpine
 RUN npm install -g pnpm
 WORKDIR /app
 
-COPY package.json pnpm-workspace.yaml ./
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY packages/shared-types/package.json ./packages/shared-types/
 COPY apps/frontend/package.json ./apps/frontend/
-RUN pnpm install --prod
+RUN pnpm install --frozen-lockfile --prod
 
 COPY --from=builder /app/apps/frontend/.next ./apps/frontend/.next
 COPY --from=builder /app/apps/frontend/public ./apps/frontend/public

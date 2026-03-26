@@ -191,6 +191,27 @@ export function saveAlphaPurchase(movieId: string): void {
   } catch { /* ignore */ }
 }
 
+export interface AlphaWatchEntry {
+  movieId: string;
+  categories: string[];
+  watchedAt: number;
+}
+
+export function getAlphaWatchHistory(): AlphaWatchEntry[] {
+  try { return JSON.parse(localStorage.getItem("alpha_watch_history") ?? "[]"); }
+  catch { return []; }
+}
+
+export function recordAlphaWatchHistory(movieId: string, categories: string[]): void {
+  try {
+    const existing = getAlphaWatchHistory().filter((e) => e.movieId !== movieId);
+    localStorage.setItem(
+      "alpha_watch_history",
+      JSON.stringify([{ movieId, categories, watchedAt: Date.now() }, ...existing].slice(0, 30))
+    );
+  } catch { /* ignore */ }
+}
+
 export function getAlphaHomeData(): HomeDto {
   const featured = ALPHA_MOVIES[0];
   const free = ALPHA_MOVIES.filter((m) => m.accessType === "free");

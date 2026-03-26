@@ -2,20 +2,22 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useForm, useFieldArray } from "react-hook-form";
+import { useRouter } from "next/navigation";
 import { useWallet, WalletName } from "@aptos-labs/wallet-adapter-react";
 import { Aptos, AptosConfig, Network, Hex } from "@aptos-labs/ts-sdk";
 import type { MovieDto } from "@shelby-movie/shared-types";
 import { getRandomAlphaThumbnail } from "@/lib/alpha-data";
 import { Upload, CheckCircle, Film, X, ImageIcon, Trash2, Clock } from "lucide-react";
+import { TransactionAudit } from "@/components/shared/TransactionAudit";
 
-const CHUNK_SIZE = 5 * 1024 * 1024;
+const CHUNK_SIZE = 10 * 1024 * 1024;
 const MAX_THUMBNAIL_MB = 0;
 const MAX_VIDEO_MB = 0;
 const PRICE_PER_MINUTE_APT = parseFloat(process.env.NEXT_PUBLIC_APT_PRICE_MULTIPLIER ?? "0.5");
 const APT_TO_OCTAS = 1e8;
 const IS_ALPHA = process.env.NEXT_PUBLIC_ALPHA_TEST === "true";
 
-const UPLOAD_STAGES_ONCHAIN = ["Commitments", "Register on Aptos", "Put to Shelby RPC"] as const;
+const UPLOAD_STAGES_ONCHAIN = ["Uploading…", "Register on Aptos", "Put to Shelby RPC"] as const;
 const UPLOAD_STAGES_ALPHA = ["Encoding metadata…", "Registering on Shelby Alpha Node…", "Confirmed on Aptos Testnet…"] as const;
 const UPLOAD_STAGES = IS_ALPHA ? UPLOAD_STAGES_ALPHA : UPLOAD_STAGES_ONCHAIN;
 type UploadStage = string | null;
@@ -43,12 +45,69 @@ interface FormValues {
   episodes: EpisodeInput[];
 }
 
-const aptosNodeUrl = process.env.NEXT_PUBLIC_APTOS_NODE_URL;
-const aptos = new Aptos(
-  aptosNodeUrl
-    ? new AptosConfig({ fullnode: aptosNodeUrl })
-    : new AptosConfig({ network: (process.env.NEXT_PUBLIC_APTOS_NETWORK as Network) ?? Network.TESTNET })
-);
+// All Aptos queries (balance, waitForTransaction, view functions) use the standard
+// Aptos Testnet node. The Shelby RPC proxy does not reliably serve these endpoints.
+const aptosTestnet = new Aptos(new AptosConfig({ network: Network.TESTNET }));
+
+// ShelbyUSD — FA metadata address + classic coin type (from @shelby-protocol/sdk constants)
+const SHELBY_SUSD_FA = "0x1b18363a9f1fe5e6ebf247daba5cc1c18052bb232efdc4c50f556053922d98e1";
+const SHELBY_SUSD_COIN_TYPE = "0x33009e852be7f93762dd0bf303383c2cb2c5cab7a30d8238ca5f9f177ae75124::shelby_usd::ShelbyUSD";
+const SUSD_DECIMALS = 6;
+// Estimated ShelbyUSD storage cost per MB (+ 5% buffer). Configurable via env.
+const SUSD_PER_MB = parseFloat(process.env.NEXT_PUBLIC_SHELBY_STORAGE_COST_PER_MB ?? "0.0005");
+
+/**
+ * Fetch ShelbyUSD balance for an address.
+ * Always uses the standard Aptos Testnet node — the Shelby RPC proxy does not
+ * reliably serve view function calls.
+ * Tries FA primary store first, falls back to classic CoinStore.
+ */
+async function fetchSUsdBalance(addr: string): Promise<number> {
+  // 1. Try FA primary_fungible_store::balance (standard for newer tokens)
+  try {
+    const result = await aptosTestnet.view({
+      payload: {
+        function: "0x1::primary_fungible_store::balance",
+        typeArguments: ["0x1::fungible_asset::Metadata"],
+        functionArguments: [addr, SHELBY_SUSD_FA],
+      },
+    });
+    const raw = Number(result[0]);
+    if (raw > 0) return raw / 10 ** SUSD_DECIMALS;
+  } catch {
+    // FA store not found — try coin store next
+  }
+
+  // 2. Fallback: classic CoinStore resource
+  try {
+    const resources = await aptosTestnet.getAccountResources({ accountAddress: addr });
+    console.log("Found Assets:", resources.map((r) => r.type));
+    const coinStore = resources.find((r) => r.type === `0x1::coin::CoinStore<${SHELBY_SUSD_COIN_TYPE}>`);
+    if (coinStore) {
+      const raw = Number((coinStore.data as any).coin?.value ?? 0);
+      return raw / 10 ** SUSD_DECIMALS;
+    }
+  } catch {
+    // ignore
+  }
+
+  // 3. Last resort: log all resources so we can see what Petra is using
+  try {
+    const resources = await aptosTestnet.getAccountResources({ accountAddress: addr });
+    const shelbyResources = resources.filter((r) =>
+      r.type.toLowerCase().includes("shelby") || r.type.includes(SHELBY_SUSD_FA.slice(0, 10))
+    );
+    if (shelbyResources.length > 0) {
+      console.log("Found Assets:", shelbyResources);
+    } else {
+      console.log("Found Assets: no ShelbyUSD resources found for", addr);
+    }
+  } catch {
+    // ignore
+  }
+
+  return 0;
+}
 
 const STREAM_URL = process.env.NEXT_PUBLIC_STREAM_URL ?? "";
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "";
@@ -105,67 +164,484 @@ function captureVideoFrame(file: File): Promise<File | null> {
   });
 }
 
+// Retry wrapper for Petra wallet calls that can fail transiently while the
+// extension service worker is initialising ("Receiving end does not exist").
+async function withWalletRetry<T>(fn: () => Promise<T>, maxAttempts = 3, delayMs = 500): Promise<T> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const msg: string = err?.message ?? "";
+      const isExtensionRace = msg.includes("Receiving end does not exist")
+        || msg.includes("Could not establish connection")
+        || msg.includes("Extension context invalidated");
+      if (isExtensionRace && attempt < maxAttempts) {
+        console.warn(`[wallet] transient extension error (attempt ${attempt}), retrying in ${delayMs}ms…`);
+        await new Promise((r) => setTimeout(r, delayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error("unreachable");
+}
+
+async function waitWithRetry(hash: string, maxAttempts = 3, delayMs = 2000): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Use standard Aptos Testnet node — the Shelby RPC node does not reliably
+      // serve the Aptos REST /transactions/by_hash endpoint.
+      await aptosTestnet.waitForTransaction({ transactionHash: hash });
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+}
+
+
+// After a 502 on the final chunk (server likely finished assembling in background),
+// wait briefly then probe whether Shelby already has the blob.
+async function probeBlobExists(blobId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${STREAM_URL}/upload/blob-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ blobId }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return false;
+    const { exists } = await res.json();
+    return Boolean(exists);
+  } catch {
+    return false;
+  }
+}
+
+// Files >= 50 MB get extended timeouts and the "assembling" UI banner.
+// Small files should finalize in seconds — use fast-track probing with no delay.
+const LARGE_FILE_THRESHOLD = 50 * 1024 * 1024;
+
+const STAGE_LABEL_TO_INDEX: Record<string, number> = {
+  "Generating upload session…": 0,
+  "Uploading…": 0,
+  "Register on Aptos": 1,
+  "Finalizing on Shelby Network…": 1,
+  "Put to Shelby RPC": 2,
+};
+
+interface ChunkCommitments {
+  blobMerkleRootHex: string;
+  numChunksets: number;
+  blobSize: number;
+  encoding: number;
+}
+
+// Uploads all chunks to the stream-node. On the last chunk the server assembles
+// the file and computes real Clay commitments — returns those for the Aptos tx.
+async function uploadChunks(
+  videoFile: File,
+  uploadSessionId: string,
+  onProgress: (pct: number) => void,
+  onStage?: (label: string) => void,
+  onAssembling?: (msg: string | null) => void
+): Promise<ChunkCommitments> {
+  onStage?.("Uploading…");
+  const totalChunks = Math.ceil(videoFile.size / CHUNK_SIZE);
+  const isLargeFile = videoFile.size >= LARGE_FILE_THRESHOLD;
+  let commitmentData: ChunkCommitments | null = null;
+
+  for (let i = 0; i < totalChunks; i++) {
+    const isLastChunk = i === totalChunks - 1;
+    // Last chunk triggers WASM commitment computation server-side — allow generous time.
+    const timeoutMs = isLastChunk ? (isLargeFile ? 600_000 : 300_000) : 30_000;
+    const maxAttempts = isLastChunk ? 3 : 1;
+    const retryBackoff = isLargeFile ? [10_000, 20_000] : [2_000, 5_000];
+
+    const start = i * CHUNK_SIZE;
+    const chunk = videoFile.slice(start, Math.min(start + CHUNK_SIZE, videoFile.size));
+
+    let lastChunkErr: string | null = null;
+    let succeeded = false;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const chunkForm = new FormData();
+        chunkForm.append("chunk", chunk);
+        chunkForm.append("chunkIndex", String(i));
+        chunkForm.append("totalChunks", String(totalChunks));
+        chunkForm.append("uploadSessionId", uploadSessionId);
+
+        if (isLastChunk) {
+          onAssembling?.("Computing commitments… Please wait.");
+        }
+
+        const chunkRes = await fetch(`${STREAM_URL}/upload/chunk`, {
+          method: "POST",
+          body: chunkForm,
+          signal: controller.signal,
+        });
+
+        if (!chunkRes.ok) {
+          const errText = await chunkRes.text().catch(() => chunkRes.statusText);
+          console.error(`[upload] Chunk ${i + 1}/${totalChunks} attempt ${attempt} — HTTP ${chunkRes.status}:`, errText);
+          lastChunkErr = `HTTP ${chunkRes.status}: ${errText}`;
+
+          if (attempt < maxAttempts) {
+            await new Promise((r) => setTimeout(r, retryBackoff[attempt - 1]));
+            continue;
+          }
+          throw new Error(`Chunk ${i + 1}/${totalChunks} failed — ${lastChunkErr}`);
+        }
+
+        const data = await chunkRes.json();
+        if (isLastChunk && data.complete && data.blobMerkleRootHex) {
+          commitmentData = {
+            blobMerkleRootHex: data.blobMerkleRootHex,
+            numChunksets: data.numChunksets,
+            blobSize: data.blobSize,
+            encoding: data.encoding,
+          };
+          onAssembling?.(null);
+        }
+
+        succeeded = true;
+        break;
+      } catch (err: any) {
+        clearTimeout(timer);
+        if (err.name === "AbortError") {
+          lastChunkErr = `timeout after ${timeoutMs / 1000}s`;
+          console.error(`[upload] Chunk ${i + 1}/${totalChunks} attempt ${attempt} timed out`);
+        } else if (err.message?.startsWith("Chunk ")) {
+          throw err;
+        } else {
+          lastChunkErr = err.message;
+          console.error(`[upload] Chunk ${i + 1}/${totalChunks} attempt ${attempt} error:`, err.message);
+        }
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, retryBackoff[attempt - 1]));
+          continue;
+        }
+        if (!succeeded) throw new Error(`Chunk ${i + 1}/${totalChunks} failed — ${lastChunkErr}`);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    onProgress(Math.round(((i + 1) / totalChunks) * 100));
+  }
+
+  if (!commitmentData) throw new Error("Upload completed but server did not return commitment data");
+  return commitmentData;
+}
+
 async function uploadBlob(
   videoFile: File,
   walletAddress: string,
   signAndSubmitTransaction: (tx: any) => Promise<{ hash: string }>,
-  onProgress: (pct: number) => void
+  onProgress: (pct: number) => void,
+  onStage?: (label: string) => void,
+  onAssembling?: (msg: string | null) => void,
+  onTxHash?: (hash: string) => void
 ): Promise<string> {
-  const commitFormData = new FormData();
-  commitFormData.append("video", videoFile);
+  // 1. Init upload session — get blobName for the Aptos tx
+  onStage?.("Generating upload session…");
+  const fileId = `${videoFile.name.replace(/[^a-zA-Z0-9]/g, "")}-${videoFile.size}-${videoFile.lastModified}`;
 
-  const commitRes = await fetch(`${STREAM_URL}/upload/commitments`, { method: "POST", body: commitFormData });
-  if (!commitRes.ok) throw new Error("Failed to calculate commitments");
+  let initRes: Response;
+  try {
+    initRes = await fetch(`${STREAM_URL}/upload/commitments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fileId }),
+    });
+  } catch (err: any) {
+    throw new Error(`Failed to init upload session — ${err?.message ?? err}`);
+  }
+  if (!initRes.ok) {
+    const body = await initRes.text().catch(() => "");
+    throw new Error(`Failed to init upload session — HTTP ${initRes.status}${body ? `: ${body}` : ""}`);
+  }
+  const { uploadSessionId, blobName, expirationMicros } = await initRes.json();
 
-  const { uploadSessionId, blobName, blobMerkleRootHex, expirationMicros, numChunksets, blobSize, encoding } =
-    await commitRes.json();
+  // 2. Upload all chunks — last chunk triggers server-side commitment computation
+  const { blobMerkleRootHex, numChunksets, blobSize, encoding } = await uploadChunks(
+    videoFile, uploadSessionId, onProgress, onStage, onAssembling
+  );
 
-  // register_blob(blobName, expirationMicros, merkleRoot: vector<u8>, numChunksets, blobSize, 0, encoding)
+  console.log("[upload] Local Merkle Root:", blobMerkleRootHex);
+
+  // 3. Sign Aptos register_blob tx with the real merkle root
+  onStage?.("Register on Aptos");
   const merkleRootBytes = Hex.fromHexInput(blobMerkleRootHex).toUint8Array();
 
-  const registerTx = await signAndSubmitTransaction({
-    data: {
-      function: `${process.env.NEXT_PUBLIC_SHELBY_CONTRACT}::blob_metadata::register_blob`,
-      typeArguments: [],
-      functionArguments: [
-        blobName,
-        expirationMicros,
-        merkleRootBytes,
-        Math.trunc(numChunksets),
-        Math.trunc(blobSize),
-        0,                        // payment tier (SDK TODO)
-        Math.trunc(encoding),
-      ],
-    },
-    options: { maxGasAmount: 10000 },
-  });
+  let registerTx: { hash: string };
+  try {
+    registerTx = await withWalletRetry(() => signAndSubmitTransaction({
+      data: {
+        function: `${process.env.NEXT_PUBLIC_SHELBY_CONTRACT}::blob_metadata::register_blob`,
+        typeArguments: [],
+        functionArguments: [
+          blobName,
+          expirationMicros,
+          merkleRootBytes,
+          Math.trunc(numChunksets),
+          Math.trunc(blobSize),
+          0,
+          Math.trunc(encoding),
+        ],
+      },
+      options: { maxGasAmount: 50000 },
+    }));
+  } catch (err: any) {
+    if (err?.message?.includes("blob") && err.message.toLowerCase().includes("already exists")) {
+      throw new Error("Upload conflict: a blob with this name already exists on Shelby and has not expired yet. Please wait ~1 hour and try again, or re-select the file.");
+    }
+    throw err;
+  }
 
-  await aptos.waitForTransaction({ transactionHash: registerTx.hash });
+  onTxHash?.(registerTx.hash);
+  onStage?.("Finalizing on Shelby Network…");
+  await waitWithRetry(registerTx.hash);
+
+  // 4. Confirm registration — triggers putBlob on the stream-node
+  onStage?.("Put to Shelby RPC");
+  const isLargeFile = videoFile.size >= LARGE_FILE_THRESHOLD;
+  const registerTimeoutMs = isLargeFile ? 600_000 : 300_000;
 
   const blobIdRes = await fetch(`${STREAM_URL}/upload/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ txHash: registerTx.hash, uploadSessionId, walletAddress }),
+    signal: AbortSignal.timeout(registerTimeoutMs),
   });
-  if (!blobIdRes.ok) throw new Error("Failed to confirm blob registration");
-  const { blobId } = await blobIdRes.json();
 
-  const totalChunks = Math.ceil(videoFile.size / CHUNK_SIZE);
-  for (let i = 0; i < totalChunks; i++) {
-    const start = i * CHUNK_SIZE;
-    const chunk = videoFile.slice(start, Math.min(start + CHUNK_SIZE, videoFile.size));
-    const chunkForm = new FormData();
-    chunkForm.append("chunk", chunk);
-    chunkForm.append("chunkIndex", String(i));
-    chunkForm.append("totalChunks", String(totalChunks));
-    chunkForm.append("uploadSessionId", uploadSessionId);
-    chunkForm.append("blobId", blobId);
-    const chunkRes = await fetch(`${STREAM_URL}/upload/chunk`, { method: "POST", body: chunkForm });
-    if (!chunkRes.ok) throw new Error(`Chunk ${i + 1}/${totalChunks} failed`);
-    onProgress(Math.round(((i + 1) / totalChunks) * 100));
+  if (!blobIdRes.ok) {
+    const errText = await blobIdRes.text().catch(() => blobIdRes.statusText);
+    // On timeout/502, probe Shelby — putBlob may have succeeded silently
+    if (blobIdRes.status === 502 || blobIdRes.status === 504) {
+      onAssembling?.("Verifying upload… Please wait.");
+      await new Promise((r) => setTimeout(r, isLargeFile ? 30_000 : 5_000));
+      const blobId = `${walletAddress}/${blobName}`;
+      const exists = await probeBlobExists(blobId);
+      onAssembling?.(null);
+      if (exists) {
+        console.log("[upload] Blob confirmed live after register timeout.");
+        return blobId;
+      }
+    }
+    throw new Error(`Failed to confirm blob registration — HTTP ${blobIdRes.status}: ${errText}`);
   }
 
+  const { blobId } = await blobIdRes.json();
   return blobId;
+}
+
+// ── UploadProgressOverlay ─────────────────────────────────────────────────────
+
+interface UploadOverlayProps {
+  stageIndex: number;
+  chunkProgress: number;
+  assemblingMsg: string | null;
+  txHash: string | null;
+  done: boolean;
+  error: string | null;
+  movieTitle: string;
+  movieId: string | null;
+  onRetry: () => void;
+  onNavigate: (path: string) => void;
+}
+
+const OVERLAY_STAGES = [
+  { label: "Fingerprint", desc: "Uploading & computing commitments" },
+  { label: "Register",    desc: "Signing on Aptos blockchain" },
+  { label: "Upload",      desc: "Sending to Shelby Network" },
+  { label: "Finalize",    desc: "Assembling & verifying" },
+] as const;
+
+function UploadProgressOverlay({
+  stageIndex, chunkProgress, assemblingMsg, txHash, done, error, movieTitle, movieId, onRetry, onNavigate,
+}: UploadOverlayProps) {
+  const [countdown, setCountdown] = useState(3);
+
+  const displayStage = assemblingMsg && stageIndex >= 2 ? 3 : Math.min(stageIndex, 2);
+
+  useEffect(() => {
+    if (!done) return;
+    let alive = true;
+    (async () => {
+      const { default: fire } = await import("canvas-confetti");
+      if (!alive) return;
+      fire({ particleCount: 160, spread: 70, origin: { y: 0.6 } });
+      setTimeout(() => alive && fire({ particleCount: 90, angle: 60,  spread: 55, origin: { x: 0 } }), 300);
+      setTimeout(() => alive && fire({ particleCount: 90, angle: 120, spread: 55, origin: { x: 1 } }), 500);
+    })();
+    return () => { alive = false; };
+  }, [done]);
+
+  useEffect(() => {
+    if (!done) return;
+    if (countdown <= 0) { onNavigate(movieId ? `/watch/${movieId}` : "/history"); return; }
+    const t = setTimeout(() => setCountdown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [done, countdown, movieId]);
+
+  const aptosUrl = txHash
+    ? `https://explorer.aptoslabs.com/txn/${txHash}?network=testnet`
+    : null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-md px-4">
+      <div className="w-full max-w-md rounded-2xl bg-[#111] border border-white/10 shadow-2xl overflow-hidden">
+        <div className="px-8 py-8 space-y-6">
+
+          {/* ── Success ── */}
+          {done ? (
+            <div className="flex flex-col items-center gap-5 text-center">
+              <div className="relative">
+                <div className="w-20 h-20 rounded-full bg-green-500/15 border-2 border-green-500/40 flex items-center justify-center">
+                  <CheckCircle className="w-10 h-10 text-green-400" />
+                </div>
+                <div className="absolute inset-0 rounded-full border-2 border-green-400/20 animate-ping" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-xl font-bold text-white">Movie Published!</h3>
+                <p className="text-sm text-gray-400">
+                  <span className="text-white font-medium">"{movieTitle}"</span> is now live on the decentralized Shelby Network.
+                </p>
+              </div>
+              {aptosUrl && (
+                <a href={aptosUrl} target="_blank" rel="noopener noreferrer"
+                  className="text-xs text-brand hover:text-brand/80 transition-colors">
+                  View registration on Aptos Explorer ↗
+                </a>
+              )}
+              <div className="flex gap-3">
+                {movieId && (
+                  <button onClick={() => onNavigate(`/watch/${movieId}`)}
+                    className="px-5 py-2 rounded-lg bg-brand text-white font-semibold text-sm hover:bg-brand-dark transition-colors">
+                    Watch Now
+                  </button>
+                )}
+                <button onClick={() => onNavigate("/history")}
+                  className="px-5 py-2 rounded-lg bg-white/10 text-gray-300 font-semibold text-sm hover:bg-white/20 transition-colors">
+                  My Library
+                </button>
+              </div>
+              <p className="text-xs text-gray-600">Redirecting in {countdown}s…</p>
+            </div>
+
+          /* ── Error ── */
+          ) : error ? (
+            <div className="flex flex-col items-center gap-5">
+              <div className="w-16 h-16 rounded-full bg-red-500/15 border-2 border-red-500/40 flex items-center justify-center">
+                <X className="w-8 h-8 text-red-400" />
+              </div>
+              <div className="w-full space-y-2 text-center">
+                <h3 className="text-lg font-bold text-white">Upload Failed</h3>
+                <p className="text-xs text-gray-500">
+                  Failed at: <span className="text-gray-300">{OVERLAY_STAGES[Math.min(stageIndex, 3)].label}</span>
+                </p>
+                <div className="rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3 text-left">
+                  <p className="text-sm text-red-300 break-words">{error}</p>
+                </div>
+              </div>
+              {aptosUrl && (
+                <a href={aptosUrl} target="_blank" rel="noopener noreferrer"
+                  className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+                  View partial transaction ↗
+                </a>
+              )}
+              <button onClick={onRetry}
+                className="w-full py-2.5 rounded-lg bg-brand text-white font-semibold text-sm hover:bg-brand-dark transition-colors">
+                Try Again
+              </button>
+            </div>
+
+          /* ── Progress ── */
+          ) : (
+            <>
+              <div className="text-center space-y-0.5">
+                <p className="text-xs text-gray-500 font-mono truncate">"{movieTitle}"</p>
+                <p className="text-sm text-gray-300 font-medium">
+                  {OVERLAY_STAGES[displayStage].desc}
+                </p>
+              </div>
+
+              {/* Stage pills */}
+              <div className="flex gap-2">
+                {OVERLAY_STAGES.map((s, i) => (
+                  <div key={s.label} className="flex-1 space-y-1">
+                    <div className={`h-1 rounded-full transition-all duration-500 ${
+                      i < displayStage ? "bg-green-500"
+                      : i === displayStage ? "bg-brand animate-pulse"
+                      : "bg-gray-700/60"
+                    }`} />
+                    <p className={`text-[10px] text-center transition-colors ${
+                      i < displayStage ? "text-green-400"
+                      : i === displayStage ? "text-gray-300"
+                      : "text-gray-600"
+                    }`}>{s.label}</p>
+                  </div>
+                ))}
+              </div>
+
+              {/* Stage 0 — chunk progress */}
+              {displayStage === 0 && (
+                <div className="space-y-2">
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>{assemblingMsg ?? "Uploading video chunks…"}</span>
+                    <span>{chunkProgress}%</span>
+                  </div>
+                  <div className="h-2 rounded-full bg-gray-800 overflow-hidden">
+                    <div className="h-full bg-brand rounded-full transition-all duration-300"
+                      style={{ width: `${chunkProgress}%` }} />
+                  </div>
+                </div>
+              )}
+
+              {/* Stage 1 — Aptos tx */}
+              {displayStage === 1 && (
+                <div className="space-y-3 text-center">
+                  <div className="flex items-center justify-center gap-2 text-sm text-gray-300">
+                    <div className="w-4 h-4 rounded-full border-2 border-brand border-t-transparent animate-spin shrink-0" />
+                    <span>{txHash ? "Confirming transaction…" : "Waiting for Petra wallet…"}</span>
+                  </div>
+                  {aptosUrl && (
+                    <a href={aptosUrl} target="_blank" rel="noopener noreferrer"
+                      className="text-xs text-brand hover:text-brand/80 transition-colors">
+                      View tx on Aptos Explorer ↗
+                    </a>
+                  )}
+                </div>
+              )}
+
+              {/* Stage 2 & 3 — putBlob / finalize */}
+              {displayStage >= 2 && (
+                <div className="space-y-3 text-center">
+                  <div className="flex items-center justify-center gap-2 text-sm text-gray-300">
+                    <div className="w-4 h-4 rounded-full border-2 border-brand border-t-transparent animate-spin shrink-0" />
+                    <span>{assemblingMsg ?? "Uploading to Shelby Network…"}</span>
+                  </div>
+                  {aptosUrl && (
+                    <a href={aptosUrl} target="_blank" rel="noopener noreferrer"
+                      className="text-xs text-gray-500 hover:text-gray-300 transition-colors">
+                      View registration tx ↗
+                    </a>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ── ThumbnailDropzone ──────────────────────────────────────────────────────────
@@ -435,9 +911,10 @@ function VideoDropzone({ onFile, label, hint, error }: VideoDropzoneProps) {
 // ── MovieUploadForm ────────────────────────────────────────────────────────────
 
 export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string) => void }) {
+  const router = useRouter();
   const { account, signAndSubmitTransaction, signMessage, connected, connect } = useWallet();
   const {
-    register, handleSubmit, watch, control, setValue,
+    register, handleSubmit, watch, control, setValue, reset,
     formState: { errors },
   } = useForm<FormValues>({
     mode: "onChange",
@@ -460,19 +937,52 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
   const [chunkProgress, setChunkProgress] = useState(0);
   const [done, setDone] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [assemblingMsg, setAssemblingMsg] = useState<string | null>(null);
   const [alphaSuccess, setAlphaSuccess] = useState(false);
+  const [txHash, setTxHash] = useState<string | null>(null);
+  const [uploadedMovieId, setUploadedMovieId] = useState<string | null>(null);
+  const [overlayActive, setOverlayActive] = useState(false);
   const [countdown, setCountdown] = useState(5);
+  const [uploadAudit, setUploadAudit] = useState<{
+    loading: boolean;
+    balanceAPT: number;
+    sUsdBalance: number;
+    sUsdStorageCost: number;
+  }>({ loading: false, balanceAPT: 0, sUsdBalance: 0, sUsdStorageCost: 0 });
 
   useEffect(() => {
     if (!alphaSuccess) return;
     const id = setInterval(() => {
       setCountdown((c) => {
-        if (c <= 1) { clearInterval(id); onSuccess?.("/history"); return 0; }
+        if (c <= 1) { clearInterval(id); if (onSuccess) onSuccess("/history"); else router.push("/history"); return 0; }
         return c - 1;
       });
     }, 1000);
     return () => clearInterval(id);
   }, [alphaSuccess]);
+
+  useEffect(() => {
+    if (!uploadedMovieId) return;
+    router.prefetch(`/watch/${uploadedMovieId}`);
+    router.prefetch("/history");
+  }, [uploadedMovieId]);
+
+  useEffect(() => {
+    if (IS_ALPHA || !connected || !account) return;
+    const addr = account.address;
+    setUploadAudit((prev) => ({ ...prev, loading: true }));
+    Promise.all([
+      aptosTestnet.getAccountAPTAmount({ accountAddress: addr }).catch(() => 0),
+      fetchSUsdBalance(addr),
+    ]).then(([aptOctas, sUsd]) => {
+      setUploadAudit((prev) => ({
+        ...prev,
+        loading: false,
+        balanceAPT: aptOctas / 1e8,
+        sUsdBalance: sUsd,
+      }));
+    }).catch(() => setUploadAudit((prev) => ({ ...prev, loading: false })));
+  }, [connected, account?.address]);
 
   const contentType = watch("type");
   const accessType = watch("accessType");
@@ -491,6 +1001,25 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
     setStageIndex(index);
     setStage(UPLOAD_STAGES[index]);
     setChunkProgress(0);
+  }
+
+  function handleStage(label: string) {
+    setStage(label);
+    const idx = STAGE_LABEL_TO_INDEX[label];
+    if (idx !== undefined) setStageIndex(idx);
+  }
+
+  function resetOverlay() {
+    setOverlayActive(false);
+    setStage(null);
+    setStageIndex(-1);
+    setSubmitError(null);
+    setDone(false);
+    setTxHash(null);
+    setUploadedMovieId(null);
+    setChunkProgress(0);
+    setAssemblingMsg(null);
+    reset();
   }
 
   async function onSubmit(values: FormValues) {
@@ -572,18 +1101,23 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
       const priceOctas = Math.round(priceAPT * APT_TO_OCTAS);
 
       if (values.type === "movie") {
-        advanceStage(0);
-
         let blobId: string;
         if (IS_ALPHA) {
+          advanceStage(0);
           blobId = mockVideoUrl || `alpha-mock-${Date.now()}`;
         } else {
-          blobId = await uploadBlob(movieFile!, walletAddress, signAndSubmitTransaction, (pct) => {
-            if (stageIndex === 2) setChunkProgress(pct);
-          });
+          setOverlayActive(true);
+          setTxHash(null);
+          setUploadedMovieId(null);
+          setStageIndex(0);
+          blobId = await uploadBlob(
+            movieFile!, walletAddress, signAndSubmitTransaction,
+            (pct) => setChunkProgress(pct),
+            (label) => handleStage(label),
+            (msg) => setAssemblingMsg(msg),
+            (hash) => setTxHash(hash),
+          );
         }
-
-        advanceStage(2);
 
         const movieRes = await fetch(`${API_URL}/api/movies`, {
           method: "POST",
@@ -606,20 +1140,32 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
           }),
         });
         if (!movieRes.ok) throw new Error("Failed to save movie metadata");
+        const { id: newMovieId } = await movieRes.json();
+        if (newMovieId) setUploadedMovieId(newMovieId);
       } else {
+        if (!IS_ALPHA) {
+          setOverlayActive(true);
+          setTxHash(null);
+          setUploadedMovieId(null);
+        }
+
         const episodeBlobs = await Promise.all(
           values.episodes.map(async (ep, idx) => {
-            advanceStage(idx % 3 as 0 | 1 | 2);
-
             let blobId: string;
             if (IS_ALPHA) {
+              advanceStage(idx % 3 as 0 | 1 | 2);
               blobId = mockVideoUrl || `alpha-mock-ep${ep.episodeNumber}-${Date.now()}`;
             } else {
-              blobId = await uploadBlob(episodeFiles[idx], walletAddress, signAndSubmitTransaction, (pct) => {
-                setChunkProgress(pct);
-              });
+              setStageIndex(0);
+              setTxHash(null);
+              blobId = await uploadBlob(
+                episodeFiles[idx], walletAddress, signAndSubmitTransaction,
+                (pct) => setChunkProgress(pct),
+                (label) => handleStage(label),
+                (msg) => setAssemblingMsg(msg),
+                (hash) => setTxHash(hash),
+              );
             }
-
             return { episodeNumber: ep.episodeNumber, title: ep.title, blobName: blobId, duration: ep.duration };
           })
         );
@@ -644,13 +1190,17 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
           }),
         });
         if (!movieRes.ok) throw new Error("Failed to save series metadata");
+        const { id: newMovieId } = await movieRes.json();
+        if (newMovieId) setUploadedMovieId(newMovieId);
       }
 
       setDone(true);
       setStage(null);
+      setAssemblingMsg(null);
     } catch (err: any) {
       setSubmitError(err.message ?? "Upload failed");
       setStage(null);
+      setAssemblingMsg(null);
     }
   }
 
@@ -661,6 +1211,15 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
     !isUploading &&
     selectedCategories.length > 0 &&
     (contentType === "series" || movieFile !== null);
+
+  const insufficientAPT = !IS_ALPHA && !uploadAudit.loading && uploadAudit.balanceAPT > 0 && uploadAudit.balanceAPT < 0.005;
+  const insufficientSUsd = !IS_ALPHA && !uploadAudit.loading && uploadAudit.sUsdStorageCost > 0 && uploadAudit.sUsdBalance < uploadAudit.sUsdStorageCost;
+  const submitLabel = isUploading
+    ? stage
+    : insufficientAPT && insufficientSUsd ? "Insufficient APT + ShelbyUSD"
+    : insufficientAPT ? "Insufficient APT"
+    : insufficientSUsd ? "Insufficient ShelbyUSD"
+    : `Publish ${contentType === "series" ? "Series" : "Movie"}`;
 
   // ── Wallet guard ──────────────────────────────────────────────────────────
   if (!IS_ALPHA && !connected) {
@@ -701,13 +1260,13 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
         </div>
         <div className="flex gap-3">
           <button
-            onClick={() => onSuccess?.("/")}
+            onClick={() => { if (onSuccess) onSuccess("/"); else router.push("/"); }}
             className="px-6 py-2.5 rounded-lg bg-brand text-white font-semibold text-sm hover:bg-brand-dark transition-colors"
           >
             Go to Home
           </button>
           <button
-            onClick={() => onSuccess?.("/history")}
+            onClick={() => { if (onSuccess) onSuccess("/history"); else router.push("/history"); }}
             className="px-6 py-2.5 rounded-lg bg-white/10 text-gray-300 font-semibold text-sm hover:bg-white/20 transition-colors"
           >
             View in Library
@@ -719,7 +1278,22 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
   }
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="space-y-6 max-w-xl">
+    <>
+      {overlayActive && !IS_ALPHA && (
+        <UploadProgressOverlay
+          stageIndex={stageIndex}
+          chunkProgress={chunkProgress}
+          assemblingMsg={assemblingMsg}
+          txHash={txHash}
+          done={done}
+          error={submitError}
+          movieTitle={watch("title") || "Your Movie"}
+          movieId={uploadedMovieId}
+          onRetry={resetOverlay}
+          onNavigate={(path) => { resetOverlay(); if (onSuccess) onSuccess(path); else router.push(path); }}
+        />
+      )}
+      <form onSubmit={handleSubmit(onSubmit)} className="space-y-6 max-w-xl">
       <h2 className="text-xl font-bold text-white">Creator Studio</h2>
 
       {IS_ALPHA && (
@@ -849,6 +1423,10 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
               setMovieFile(file);
               setMovieFileError(null);
               setValue("durationSeconds", duration > 0 ? duration : 0);
+              setUploadAudit((prev) => ({
+                ...prev,
+                sUsdStorageCost: file ? (file.size / 1e6) * SUSD_PER_MB : 0,
+              }));
               if (file && !thumbnailFile) {
                 captureVideoFrame(file).then((frame) => setCapturedFrameFile(frame));
               } else if (!file) {
@@ -1021,8 +1599,8 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
         </div>
       )}
 
-      {/* 3-stage progress */}
-      {isUploading && (
+      {/* 3-stage progress — only shown in alpha mode; real uploads use the overlay */}
+      {isUploading && IS_ALPHA && (
         <div className="space-y-3">
           <div className="flex gap-1.5">
             {UPLOAD_STAGES.map((s, i) => (
@@ -1037,10 +1615,16 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
           {stageIndex === 2 && !IS_ALPHA && (
             <p className="text-sm text-gray-400 text-center">{chunkProgress}% uploaded</p>
           )}
+          {assemblingMsg && (
+            <div className="flex items-start gap-3 px-4 py-3 rounded-lg bg-amber-500/10 border border-amber-500/30 animate-pulse">
+              <span className="text-amber-400 text-lg shrink-0">⏳</span>
+              <p className="text-amber-300 text-sm leading-relaxed">{assemblingMsg}</p>
+            </div>
+          )}
         </div>
       )}
 
-      {done && (
+      {done && !overlayActive && (
         <div className="flex items-start gap-3 px-4 py-3 rounded-lg bg-green-500/10 border border-green-500/30">
           <CheckCircle className="w-4 h-4 text-green-400 mt-0.5 shrink-0" />
           <div>
@@ -1054,20 +1638,46 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
         </div>
       )}
 
-      {submitError && (
+      {submitError && !overlayActive && (
         <p className="text-red-400 text-sm px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/20">
           {submitError}
         </p>
       )}
 
+      {!IS_ALPHA && connected && isReady && !isUploading && (
+        <TransactionAudit
+          balanceAPT={uploadAudit.balanceAPT}
+          priceAPT={0}
+          gasCostAPT={0.005}
+          loading={uploadAudit.loading}
+          priceLabel="Registration fee"
+          sUsdBalance={uploadAudit.sUsdBalance}
+          sUsdStorageCost={uploadAudit.sUsdStorageCost > 0 ? uploadAudit.sUsdStorageCost : undefined}
+          onRefreshBalance={() => {
+            if (!account) return;
+            const addr = account.address;
+            setUploadAudit((prev) => ({ ...prev, loading: true }));
+            Promise.all([
+              aptosTestnet.getAccountAPTAmount({ accountAddress: addr }).catch(() => 0),
+              fetchSUsdBalance(addr),
+            ]).then(([aptOctas, sUsd]) => {
+              setUploadAudit((prev) => ({
+                ...prev,
+                loading: false,
+                balanceAPT: aptOctas / 1e8,
+                sUsdBalance: sUsd,
+              }));
+            }).catch(() => setUploadAudit((prev) => ({ ...prev, loading: false })));
+          }}
+        />
+      )}
+
       <button
         type="submit"
-        disabled={!isReady}
+        disabled={!isReady || insufficientAPT || insufficientSUsd}
         className="w-full py-3 rounded-lg bg-brand text-white font-bold text-sm hover:bg-brand-dark transition disabled:opacity-40 disabled:cursor-not-allowed"
       >
-        {isUploading
-          ? stage
-          : `Publish ${contentType === "series" ? "Series" : "Movie"}`}
+        {submitLabel}
       </button>
 
       {!isReady && !isUploading && (
@@ -1078,5 +1688,6 @@ export function MovieUploadForm({ onSuccess }: { onSuccess?: (redirectTo: string
         </p>
       )}
     </form>
+    </>
   );
 }

@@ -4,16 +4,14 @@ import { useState, useEffect } from "react";
 import { useWallet } from "@aptos-labs/wallet-adapter-react";
 import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk";
 import type { MovieDto } from "@shelby-movie/shared-types";
-import { getAlphaPurchased, saveAlphaPurchase } from "@/lib/alpha-data";
+import { getAlphaPurchased, saveAlphaPurchase, recordAlphaWatchHistory } from "@/lib/alpha-data";
+import { useUserIdentity } from "@/hooks/useUserIdentity";
 import { VideoPlayer } from "./VideoPlayer";
 import { EpisodeSidebar } from "./EpisodeSidebar";
+import { TransactionAudit } from "@/components/shared/TransactionAudit";
 
-const aptosNodeUrl = process.env.NEXT_PUBLIC_APTOS_NODE_URL;
-const aptos = new Aptos(
-  aptosNodeUrl
-    ? new AptosConfig({ fullnode: aptosNodeUrl })
-    : new AptosConfig({ network: (process.env.NEXT_PUBLIC_APTOS_NETWORK as Network) ?? Network.TESTNET })
-);
+// MovieWatch only performs coin::transfer on Aptos Testnet — never needs the Shelby node.
+const aptos = new Aptos(new AptosConfig({ network: Network.TESTNET }));
 
 const APT_RECIPIENT = process.env.NEXT_PUBLIC_TREASURY_ADDRESS ?? "";
 const API = process.env.NEXT_PUBLIC_API_URL ?? "";
@@ -42,6 +40,7 @@ export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: Movi
   const isSeries = movie.type === "series" && movie.episodes.length > 0;
 
   const { account, signAndSubmitTransaction, signMessage, connected } = useWallet();
+  const { userId } = useUserIdentity();
 
   // isPurchased: true for free movies always; for paid alpha movies, check sessionStorage
   const [isPurchased, setIsPurchased] = useState<boolean>(() => {
@@ -62,12 +61,40 @@ export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: Movi
   const [resumePosition, setResumePosition] = useState<number | null>(null);
   const [bgPurchaseLoading, setBgPurchaseLoading] = useState(false);
   const [showStickyBar, setShowStickyBar] = useState(false);
+  const [accountNotFound, setAccountNotFound] = useState(false);
+  const [gasEstimate, setGasEstimate] = useState<{
+    loading: boolean;
+    balanceOctas: number;
+    gasUsed: number;
+    gasUnitPrice: number;
+  }>({ loading: false, balanceOctas: 0, gasUsed: 0, gasUnitPrice: 100 });
+  const [maxGasAmount, setMaxGasAmount] = useState(20000);
+  const [gasError, setGasError] = useState<{ haveAPT: number; needAPT: number } | null>(null);
+  const [copiedAddress, setCopiedAddress] = useState(false);
+  // Global sticky alert — visible in the browser window even while Petra floats on top
+  const [txGasAlert, setTxGasAlert] = useState<{ haveAPT: number; needAPT: number; shortfall: number } | null>(null);
 
   useEffect(() => {
     const onScroll = () => setShowStickyBar(window.scrollY > 80);
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
   }, []);
+
+  useEffect(() => {
+    if (showPaywall && connected && account && !IS_ALPHA) {
+      fetchGasEstimate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showPaywall, connected, account?.address]);
+
+  // Record to localStorage after 30s of watching (alpha anonymous tracking)
+  useEffect(() => {
+    if (!IS_ALPHA || sessionToken === null || resumePosition === null) return;
+    const timer = setTimeout(() => {
+      recordAlphaWatchHistory(movie.id, movie.categories);
+    }, 30_000);
+    return () => clearTimeout(timer);
+  }, [sessionToken, resumePosition, movie.id, movie.categories]);
 
   const previewDuration = !isFree && !IS_ALPHA ? movie.previewDuration : undefined;
   const alphaPreviewLimit =
@@ -102,6 +129,10 @@ export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: Movi
     setDirectVideoUrl(null);
     setShowPaywall(false);
     setResumePosition(null);
+    setAccountNotFound(false);
+    setGasError(null);
+    setTxGasAlert(null);
+    setError(null);
     grantAccess();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [episode]);
@@ -183,13 +214,113 @@ export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: Movi
     setLoading(true);
     setTxStep("signing");
     setError(null);
+    setAccountNotFound(false);
+    setTxGasAlert(null);
+
+    const priceOctas = Math.round(movie.priceAPT * 1e8);
+
+    // ── Step 1: verify account exists on-chain ────────────────────────────────
     try {
-      const priceOctas = Math.round(movie.priceAPT * 1e8);
+      await aptos.getAccountInfo({ accountAddress: account.address });
+    } catch (preErr: any) {
+      const preMsg = (preErr?.message ?? preErr?.toString() ?? "").toLowerCase();
+      if (isAccountNotFoundMsg(preMsg)) {
+        setAccountNotFound(true);
+        setError("account_not_found");
+        setLoading(false);
+        setTxStep(null);
+        return;
+      }
+      // Network hiccup — don't block, fall through
+    }
+
+    // ── Step 2: Inline simulation gate ───────────────────────────────────────
+    // Runs BEFORE signAndSubmitTransaction — Petra must never open if gas is short.
+    let resolvedMaxGas = maxGasAmount;
+    let resolvedGasUnitPrice = Math.max(gasEstimate.gasUnitPrice, 150);
+    let balanceForGate = 0;
+    try {
+      const [balanceOctas, simTx] = await Promise.all([
+        aptos.getAccountAPTAmount({ accountAddress: account.address }),
+        aptos.transaction.build.simple({
+          sender: account.address,
+          data: {
+            function: "0x1::coin::transfer",
+            typeArguments: ["0x1::aptos_coin::AptosCoin"],
+            functionArguments: [APT_RECIPIENT, priceOctas],
+          },
+          options: { maxGasAmount: 200000 },
+        }),
+      ]);
+      balanceForGate = balanceOctas;
+      const [sim] = await aptos.transaction.simulate.simple({ transaction: simTx });
+      const gasUsed = parseInt(sim.gas_used, 10);
+      const gasUnitPrice = parseInt(sim.gas_unit_price, 10);
+      // 20% safety buffer on top of simulated gas, floor at 30k
+      const bufferedGas = Math.ceil(gasUsed * 1.2);
+      const gasCostOctas = bufferedGas * gasUnitPrice;
+      resolvedMaxGas = Math.max(bufferedGas, 50000);
+      resolvedGasUnitPrice = Math.max(gasUnitPrice, 150);
+
+      const vmStatus = (sim.vm_status ?? "").toLowerCase();
+      const isGasFailure =
+        !sim.success &&
+        (vmStatus.includes("out_of_gas") ||
+          vmStatus.includes("out of gas") ||
+          vmStatus.includes("insufficient_balance_for_transaction_fee") ||
+          vmStatus.includes("insufficient balance"));
+
+      const totalRequired = priceOctas + gasCostOctas;
+      if (isGasFailure || balanceOctas < totalRequired) {
+        const haveAPT = balanceOctas / 1e8;
+        const needAPT = totalRequired / 1e8;
+        setTxGasAlert({ haveAPT, needAPT, shortfall: Math.max(needAPT - haveAPT, 0) });
+        setGasError({ haveAPT, needAPT });
+        setLoading(false);
+        setTxStep(null);
+        return;
+      }
+      setMaxGasAmount(resolvedMaxGas);
+      setGasEstimate({ loading: false, balanceOctas, gasUsed, gasUnitPrice });
+    } catch (simErr: any) {
+      const simMsg = (simErr?.message ?? simErr?.toString() ?? "").toLowerCase();
+      if (isAccountNotFoundMsg(simMsg)) {
+        setAccountNotFound(true);
+        setError("account_not_found");
+        setLoading(false);
+        setTxStep(null);
+        return;
+      }
+      // Simulation threw due to gas / balance — block Petra
+      if (
+        simMsg.includes("out_of_gas") ||
+        simMsg.includes("out of gas") ||
+        simMsg.includes("insufficient_balance") ||
+        simMsg.includes("insufficient balance") ||
+        simMsg.includes("gas")
+      ) {
+        const haveAPT = balanceForGate / 1e8;
+        const needAPT = movie.priceAPT + 0.005;
+        setTxGasAlert({ haveAPT, needAPT, shortfall: Math.max(needAPT - haveAPT, 0) });
+        setGasError({ haveAPT, needAPT });
+        setLoading(false);
+        setTxStep(null);
+        return;
+      }
+      // Unrecognised network error — let Petra show it
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    try {
       const response = await signAndSubmitTransaction({
         data: {
           function: "0x1::coin::transfer",
           typeArguments: ["0x1::aptos_coin::AptosCoin"],
           functionArguments: [APT_RECIPIENT, priceOctas],
+        },
+        options: {
+          gasUnitPrice: resolvedGasUnitPrice,
+          maxGasAmount: resolvedMaxGas,
         },
       });
       setTxStep("confirming");
@@ -207,16 +338,117 @@ export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: Movi
       const { sessionToken: token } = await verifyRes.json();
       setSessionToken(token);
       setShowPaywall(false);
+      setTxGasAlert(null);
     } catch (err: any) {
-      setError(err.message ?? "Unknown error");
+      const msg = (err?.message ?? err?.toString() ?? "").toLowerCase();
+      if (isAccountNotFoundMsg(msg)) {
+        setAccountNotFound(true);
+        setError("account_not_found");
+      } else if (msg.includes("out_of_gas") || msg.includes("out of gas") || msg.includes("outofgas")) {
+        const have = gasEstimate.balanceOctas > 0 ? gasEstimate.balanceOctas / 1e8 : 0;
+        const gasCost = (gasEstimate.gasUsed * gasEstimate.gasUnitPrice) / 1e8;
+        const haveAPT = have;
+        const needAPT = movie.priceAPT + gasCost;
+        setGasError({ haveAPT, needAPT });
+        setTxGasAlert({ haveAPT, needAPT, shortfall: Math.max(needAPT - haveAPT, 0) });
+        setError("out_of_gas");
+      } else if (msg.includes("rejected") || msg.includes("user rejected") || msg.includes("cancelled")) {
+        setError("Transaction cancelled.");
+      } else {
+        setError(err.message ?? "Transaction failed");
+      }
     } finally {
       setLoading(false);
       setTxStep(null);
     }
   }
 
+  function isAccountNotFoundMsg(msg: string) {
+    return (
+      msg.includes("account not found") ||
+      msg.includes("account_not_found") ||
+      msg.includes("no account exist") ||
+      msg.includes("resource not found") ||
+      msg.includes("account does not exist")
+    );
+  }
+
   function handlePreviewEnd() {
     setShowPaywall(true);
+  }
+
+  function copyAddress() {
+    if (!account) return;
+    navigator.clipboard.writeText(account.address).then(() => {
+      setCopiedAddress(true);
+      setTimeout(() => setCopiedAddress(false), 2000);
+    });
+  }
+
+  async function fetchGasEstimate() {
+    if (!account || IS_ALPHA) return;
+    setGasEstimate({ loading: true, balanceOctas: 0, gasUsed: 0, gasUnitPrice: 100 });
+    setGasError(null);
+
+    // Step 1: verify account exists on-chain before any tx operations
+    try {
+      await aptos.getAccountInfo({ accountAddress: account.address });
+    } catch (err: any) {
+      const msg = (err?.message ?? err?.toString() ?? "").toLowerCase();
+      if (isAccountNotFoundMsg(msg)) {
+        setAccountNotFound(true);
+        setGasEstimate({ loading: false, balanceOctas: 0, gasUsed: 0, gasUnitPrice: 100 });
+        return;
+      }
+      // Network error — fall through and try the balance fetch anyway
+    }
+
+    try {
+      const priceOctas = Math.round(movie.priceAPT * 1e8);
+      const [balanceOctas, tx] = await Promise.all([
+        aptos.getAccountAPTAmount({ accountAddress: account.address }).catch(() => 0),
+        aptos.transaction.build.simple({
+          sender: account.address,
+          data: {
+            function: "0x1::coin::transfer",
+            typeArguments: ["0x1::aptos_coin::AptosCoin"],
+            functionArguments: [APT_RECIPIENT, priceOctas],
+          },
+          options: { maxGasAmount: 200000 },
+        }),
+      ]);
+      const [sim] = await aptos.transaction.simulate.simple({ transaction: tx });
+      const gasUsed = parseInt(sim.gas_used, 10);
+      const gasUnitPrice = parseInt(sim.gas_unit_price, 10);
+      const bufferedGas = Math.ceil(gasUsed * 1.2);
+      const gasCostOctas = bufferedGas * gasUnitPrice;
+      setMaxGasAmount(Math.max(bufferedGas, 50000));
+      setGasEstimate({ loading: false, balanceOctas, gasUsed, gasUnitPrice });
+
+      if (!sim.success) {
+        const status = (sim.vm_status ?? "").toLowerCase();
+        if (
+          status.includes("out_of_gas") ||
+          status.includes("out of gas") ||
+          status.includes("insufficient_balance_for_transaction_fee") ||
+          status.includes("insufficient balance")
+        ) {
+          setGasError({ haveAPT: balanceOctas / 1e8, needAPT: (priceOctas + gasCostOctas) / 1e8 });
+        }
+      }
+    } catch (err: any) {
+      const msg = (err?.message ?? err?.toString() ?? "").toLowerCase();
+      if (isAccountNotFoundMsg(msg)) {
+        setAccountNotFound(true);
+        setGasEstimate({ loading: false, balanceOctas: 0, gasUsed: 0, gasUnitPrice: 100 });
+        return;
+      }
+      const balanceOctas = await aptos.getAccountAPTAmount({ accountAddress: account.address }).catch(() => 0);
+      setGasEstimate({ loading: false, balanceOctas, gasUsed: 0, gasUnitPrice: 100 });
+      if (msg.includes("out_of_gas") || msg.includes("out of gas") || msg.includes("outofgas")) {
+        setGasError({ haveAPT: balanceOctas / 1e8, needAPT: movie.priceAPT + 0.005 });
+      }
+    }
   }
 
   const currentEpisodeTitle = isSeries
@@ -225,6 +457,49 @@ export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: Movi
 
   return (
     <div className="space-y-6">
+
+      {/* ── Global gas alert — fixed top, visible alongside Petra popup ─────── */}
+      {txGasAlert && (
+        <div className="fixed top-0 left-0 right-0 z-[300] bg-red-950 border-b border-red-500/40 px-6 py-4 flex items-start justify-between gap-4 shadow-2xl">
+          <div className="flex-1 min-w-0">
+            <p className="text-red-300 font-bold text-sm">Transaction Blocked: Insufficient Gas</p>
+            <p className="text-gray-300 text-xs mt-1">
+              You currently have{" "}
+              <strong className="text-red-300 font-mono">{txGasAlert.haveAPT.toFixed(4)} APT</strong>.
+              {" "}This transaction requires approximately{" "}
+              <strong className="text-white font-mono">{txGasAlert.needAPT.toFixed(4)} APT</strong>{" "}
+              to succeed. You are short by{" "}
+              <strong className="text-red-300 font-mono">{txGasAlert.shortfall.toFixed(4)} APT</strong>.
+            </p>
+            <p className="text-gray-500 text-[11px] mt-1.5">
+              Open Petra → <strong className="text-gray-400">Faucet</strong> → paste your address, then retry.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <a
+              href="https://aptoslabs.com/testnet-faucet"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-3 py-1.5 rounded bg-green-600/30 border border-green-500/40 text-green-300 text-xs font-semibold hover:bg-green-600/50 transition whitespace-nowrap"
+            >
+              Get Gas
+            </a>
+            <button
+              onClick={copyAddress}
+              className="px-3 py-1.5 rounded bg-amber-500/20 border border-amber-500/30 text-amber-300 text-xs font-semibold hover:bg-amber-500/30 transition whitespace-nowrap"
+            >
+              {copiedAddress ? "✓ Copied" : "Copy Address"}
+            </button>
+            <button
+              onClick={() => setTxGasAlert(null)}
+              className="px-3 py-1.5 rounded bg-white/10 text-gray-400 text-xs hover:bg-white/20 transition"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
       {purchaseToast && (
         <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[200] flex items-center gap-2.5 px-5 py-3 rounded-xl bg-green-600 text-white text-sm font-semibold shadow-2xl animate-toast-in whitespace-nowrap">
           <span>✓</span> Full version unlocked! Enjoy the rest of the film.
@@ -341,30 +616,101 @@ export function MovieWatch({ movie, alphaStreamToken, initialEpisode = 1 }: Movi
                 onPreviewEnd={handlePreviewEnd}
                 isPurchased={isPurchased}
                 alphaPreviewLimit={alphaPreviewLimit}
+                userId={userId || undefined}
                 onPurchase={IS_ALPHA && !isFree ? handleAlphaPurchase : undefined}
                 purchasePending={bgPurchaseLoading}
               />
 
               {showPaywall && !IS_ALPHA && (
-                <div className="absolute inset-0 rounded-xl bg-black/90 flex flex-col items-center justify-center gap-4 z-20">
+                <div className="absolute inset-0 rounded-xl bg-black/90 flex flex-col items-center justify-center gap-4 z-20 px-8 text-center">
                   {txStep ? (
                     <>
                       <div className="w-8 h-8 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                      <p className="text-white text-sm">
-                        {txStep === "signing" ? "Confirm in your Petra wallet…" : "Waiting for Aptos network confirmation…"}
+                      <p className="text-white text-sm font-medium">
+                        {txStep === "signing" ? "Waiting for Aptos Testnet… Confirm in Petra" : "Confirming on Aptos Testnet…"}
                       </p>
                     </>
-                  ) : (
+                  ) : accountNotFound ? (
                     <>
-                      <p className="text-white text-lg font-bold">Preview ended</p>
-                      <p className="text-gray-400 text-sm">Unlock the full movie to keep watching</p>
-                      {error && <p className="text-red-400 text-sm">{error}</p>}
-                      <button onClick={handlePurchase} disabled={loading} className="flex items-center gap-2 px-8 py-3 rounded bg-brand text-white font-bold hover:bg-brand-dark transition disabled:opacity-50">
-                        <span>▶</span> Unlock Movie — {movie.priceAPT.toFixed(2)} APT
-                      </button>
-                      {!connected && <p className="text-gray-500 text-xs">Connect your Petra wallet to purchase.</p>}
+                      <div className="text-4xl">⚠️</div>
+                      <p className="text-white text-lg font-bold">Account Not Active</p>
+                      <p className="text-gray-400 text-sm max-w-sm text-center">
+                        Your wallet address exists but isn&apos;t registered on Aptos Testnet yet. Please Faucet some APT and send a small test transaction to yourself to initialize it.
+                      </p>
+                      <div className="flex flex-col items-center gap-2 mt-1">
+                        <p className="text-gray-500 text-xs">Open Petra → tap <strong className="text-gray-400">Faucet</strong> → send APT to yourself</p>
+                        <p className="text-gray-600 text-[11px] font-mono break-all max-w-xs">{account?.address}</p>
+                      </div>
+                      <div className="flex gap-3 mt-2">
+                        <button
+                          onClick={copyAddress}
+                          className="px-5 py-2.5 rounded bg-amber-500/20 border border-amber-500/30 text-amber-300 text-sm font-semibold hover:bg-amber-500/30 transition"
+                        >
+                          {copiedAddress ? "✓ Copied" : "Copy Address"}
+                        </button>
+                        <button
+                          onClick={() => { setAccountNotFound(false); setError(null); handlePurchase(); }}
+                          disabled={loading}
+                          className="px-6 py-2.5 rounded bg-brand text-white text-sm font-bold hover:bg-brand-dark transition disabled:opacity-50"
+                        >
+                          Try Again
+                        </button>
+                        <button
+                          onClick={() => { setAccountNotFound(false); setError(null); }}
+                          className="px-5 py-2.5 rounded bg-white/10 text-gray-300 text-sm hover:bg-white/20 transition"
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     </>
-                  )}
+                  ) : (() => {
+                    const priceOctas = Math.round(movie.priceAPT * 1e8);
+                    const bufferedGasUsed = Math.ceil(gasEstimate.gasUsed * 1.2);
+                    const gasCostOctas = bufferedGasUsed * gasEstimate.gasUnitPrice;
+                    const totalOctas = priceOctas + gasCostOctas;
+                    const balanceOctas = gasEstimate.balanceOctas;
+                    const shortfallOctas = Math.max(totalOctas - balanceOctas, 0);
+                    const insufficient = connected && !gasEstimate.loading && balanceOctas > 0 && balanceOctas < totalOctas;
+                    const hasGasError = !!gasError;
+                    const blockPurchase = loading || hasGasError || insufficient || gasEstimate.loading;
+                    return (
+                      <>
+                        <p className="text-white text-lg font-bold">Preview ended</p>
+                        <p className="text-gray-400 text-sm">Unlock the full movie to keep watching</p>
+
+                        {connected && (
+                          <div className="w-full max-w-xs">
+                            <TransactionAudit
+                              balanceAPT={balanceOctas / 1e8}
+                              priceAPT={movie.priceAPT}
+                              gasCostAPT={gasCostOctas / 1e8}
+                              loading={gasEstimate.loading}
+                              priceLabel="Movie price"
+                              onRefreshBalance={() => fetchGasEstimate()}
+                              onRefresh={() => { setGasError(null); fetchGasEstimate(); }}
+                              onCopyAddress={copyAddress}
+                              copiedAddress={copiedAddress}
+                            />
+                          </div>
+                        )}
+
+                        {error && error !== "out_of_gas" && error !== "account_not_found" && (
+                          <p className="text-red-400 text-sm">{error}</p>
+                        )}
+                        <button
+                          onClick={handlePurchase}
+                          disabled={blockPurchase}
+                          className="flex items-center gap-2 px-8 py-3 rounded bg-brand text-white font-bold hover:bg-brand-dark transition disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {loading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <span>▶</span>}
+                          {insufficient || hasGasError
+                            ? "Insufficient APT"
+                            : `Unlock Movie — ${movie.priceAPT.toFixed(2)} APT`}
+                        </button>
+                        {!connected && <p className="text-gray-500 text-xs">Connect your Petra wallet to purchase.</p>}
+                      </>
+                    );
+                  })()}
                 </div>
               )}
             </div>

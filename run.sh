@@ -3,19 +3,23 @@
 # run.sh — ShelbyMovie deployment helper
 #
 # Usage:
-#   ./run.sh dev     — on-chain mode  (port 4545, Petra wallet required)
-#   ./run.sh alpha   — off-chain mode (port 4546, no wallet or APT needed)
+#   ./run.sh dev          — on-chain mode  (port 4545, Petra wallet required)
+#   ./run.sh alpha        — off-chain mode (port 4546, no wallet or APT needed)
+#   ./run.sh dev --clean  — wipe ALL Docker volumes before starting (fresh DB)
+#   ./run.sh alpha --clean
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 MODE="${1:-}"
+CLEAN="${2:-}"
 
 usage() {
   echo ""
-  echo "  Usage: $0 [dev|alpha]"
+  echo "  Usage: $0 [dev|alpha] [--clean]"
   echo ""
-  echo "    dev   — on-chain (Aptos + Shelby) frontend on port 4545"
-  echo "    alpha — off-chain test mode, mock data, no wallet needed, port 4546"
+  echo "    dev          — on-chain (Aptos + Shelby) frontend on port 4545"
+  echo "    alpha        — off-chain test mode, mock data, no wallet needed, port 4546"
+  echo "    --clean      — WARNING: destroys all Docker volumes (wipes MongoDB + Redis)"
   echo ""
 }
 
@@ -35,10 +39,14 @@ if [[ "$MODE" == "alpha" ]]; then
   ENV_FILE=".env.alpha"
   COMPOSE_PROFILES="--profile alpha"
   export ALPHA_SEED="true"
+  export MONGO_DB="shelby_alpha"
+  export REDIS_KEY_PREFIX="alpha"
 else
   ENV_FILE=".env.production"
   COMPOSE_PROFILES="--profile onchain"
   export ALPHA_SEED="false"
+  export MONGO_DB="shelby_onchain"
+  export REDIS_KEY_PREFIX="onchain"
 fi
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -56,8 +64,14 @@ echo "  └───────────────────────
 echo ""
 
 # ── Step 1: Tear down existing containers ─────────────────────────────────────
-echo "  [1/5] Stopping containers..."
-docker compose down --remove-orphans
+if [[ "$CLEAN" == "--clean" ]]; then
+  echo "  [1/5] Stopping containers and wiping volumes (--clean)..."
+  docker compose down --remove-orphans -v
+  echo "  ✓ Volumes wiped — starting with a blank database."
+else
+  echo "  [1/5] Stopping containers..."
+  docker compose down --remove-orphans
+fi
 echo ""
 
 # ── Step 2: Prune build cache ─────────────────────────────────────────────────
@@ -99,7 +113,7 @@ echo ""
 if [[ "$MODE" == "alpha" ]]; then
   echo "  [5/5] Wiping movies collection and re-seeding fresh data..."
   docker compose exec -T mongodb mongosh --quiet \
-    --eval "db.getSiblingDB('shelbymovie').movies.deleteMany({})" > /dev/null
+    --eval "db.getSiblingDB('${MONGO_DB}').movies.deleteMany({})" > /dev/null
   curl -sf -X POST http://localhost:8080/api/admin/seed > /dev/null
   echo "  ✓ Movies collection refreshed."
   echo ""
@@ -116,6 +130,7 @@ if [[ "$MODE" == "alpha" ]]; then
   echo "  │                                                  │"
   echo "  │  Frontend  →  http://localhost:4546              │"
   echo "  │  API       →  http://localhost:8080              │"
+  echo "  │  Database  →  MongoDB: ${MONGO_DB}              │"
   echo "  │                                                  │"
   echo "  │  No Petra wallet required.                       │"
   echo "  │  Mock movies are pre-seeded in MongoDB.          │"
@@ -127,6 +142,7 @@ else
   echo "  │  Frontend  →  http://localhost:4545              │"
   echo "  │  Nginx     →  http://localhost                   │"
   echo "  │  API       →  http://localhost:8080              │"
+  echo "  │  Database  →  MongoDB: ${MONGO_DB}            │"
   echo "  │                                                  │"
   echo "  │  Petra wallet required for uploads and payments. │"
   echo "  └──────────────────────────────────────────────────┘"

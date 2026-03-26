@@ -1,6 +1,8 @@
 import { Request, Response } from "express";
 import * as movieService from "../services/movie.service";
+import { getRecommendations } from "../services/recommendation.service";
 import type { ProgressUpdateDto } from "@shelby-movie/shared-types";
+import { Progress } from "../models/progress.model";
 
 export async function home(req: Request, res: Response) {
   const walletAddress = req.query.walletAddress as string | undefined;
@@ -42,6 +44,24 @@ export async function progress(req: Request, res: Response) {
     dto.lastPosition
   );
 
+  res.json({ ok: true });
+}
+
+export async function recommendations(req: Request, res: Response) {
+  const walletAddress = req.query.walletAddress as string | undefined;
+  const movies = await getRecommendations(walletAddress);
+  res.json(movies);
+}
+
+export async function migrateHistory(req: Request, res: Response) {
+  const { anonymousId, walletAddress } = req.body;
+  if (!anonymousId || !walletAddress) {
+    return res.status(400).json({ error: "anonymousId and walletAddress required" });
+  }
+  await Progress.updateMany(
+    { userAddress: anonymousId },
+    { $set: { userAddress: walletAddress.toLowerCase() } }
+  );
   res.json({ ok: true });
 }
 

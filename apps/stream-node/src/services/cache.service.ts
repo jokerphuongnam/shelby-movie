@@ -5,15 +5,16 @@ import Redis from "ioredis";
 const CHUNK_SIZE = 1024 * 1024; // 1MB
 const CHUNK_TTL = parseInt(process.env.REDIS_CHUNK_TTL_SECONDS ?? "3600", 10);
 const SESSION_TTL = parseInt(process.env.SESSION_TTL_SECONDS ?? "21600", 10);
+const KEY_PREFIX = process.env.REDIS_KEY_PREFIX ?? "onchain";
 
 export const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379");
 
 function chunkKey(blobId: string, chunkIndex: number) {
-  return `shelby:chunk:${blobId}:${chunkIndex}`;
+  return `${KEY_PREFIX}:chunk:${blobId}:${chunkIndex}`;
 }
 
 function sessionKey(sessionToken: string) {
-  return `session:${sessionToken}`;
+  return `${KEY_PREFIX}:session:${sessionToken}`;
 }
 
 export async function getChunk(blobId: string, chunkIndex: number): Promise<Buffer | null> {

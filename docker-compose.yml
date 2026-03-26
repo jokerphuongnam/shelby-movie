@@ -6,7 +6,7 @@ services:
     container_name: api-gateway
     env_file: ./apps/api-gateway/.env
     environment:
-      - MONGO_URI=mongodb://mongodb:27017/shelbymovie
+      - MONGO_URI=mongodb://mongodb:27017/${MONGO_DB:-shelby_onchain}
       - NATS_URL=nats://nats-server:4222
       - PORT=3000
       - ALPHA_SEED=${ALPHA_SEED:-false}
@@ -44,6 +44,7 @@ services:
     env_file: ./apps/stream-node/.env
     environment:
       - REDIS_URL=redis://redis:6379
+      - REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX:-onchain}
       - NATS_URL=nats://nats-server:4222
       - PORT=4000
     depends_on:

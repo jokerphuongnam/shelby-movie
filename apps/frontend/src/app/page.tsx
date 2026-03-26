@@ -2,6 +2,7 @@ import { NavHeader } from "@/components/layout/NavHeader";
 import { HeroBanner } from "@/components/movie/HeroBanner";
 import { MovieRow } from "@/components/movie/MovieRow";
 import { ContinueWatchingRow } from "@/components/movie/ContinueWatchingRow";
+import { RecommendedRow } from "@/components/movie/RecommendedRow";
 import { WelcomeHero } from "@/components/home/WelcomeHero";
 import { getAlphaHomeData } from "@/lib/alpha-data";
 import type { HomeDto } from "@shelby-movie/shared-types";
@@ -39,6 +40,7 @@ export default async function HomePage() {
       {hasContent ? (
         <div className="space-y-10 py-10">
           {!IS_ALPHA && <ContinueWatchingRow />}
+          <RecommendedRow />
           {sections.map((section) => (
             <MovieRow key={section.title} title={section.title} movies={section.movies} />
           ))}

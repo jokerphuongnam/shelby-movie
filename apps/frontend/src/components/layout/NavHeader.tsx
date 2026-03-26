@@ -17,6 +17,19 @@ export function NavHeader() {
   const [uploadToast, setUploadToast] = useState(false);
 
   useEffect(() => {
+    // Clear alpha localStorage state when running in onchain (dev) mode
+    if (!IS_ALPHA) {
+      const ALPHA_KEYS = [
+        "shelby_purchases",
+        "alpha_watch_history",
+        "shelby_anon_id",
+        "shelby_anon_migrated",
+      ];
+      ALPHA_KEYS.forEach((k) => localStorage.removeItem(k));
+    }
+  }, []);
+
+  useEffect(() => {
     if (sessionStorage.getItem("alpha_upload_toast")) {
       sessionStorage.removeItem("alpha_upload_toast");
       setUploadToast(true);
